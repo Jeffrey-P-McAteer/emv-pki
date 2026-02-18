@@ -1,3 +1,7 @@
 __pycache__
 pyenv
 env
+card_pubkey.pem
+*.pem
+
+

@@ -62,9 +62,17 @@ import os as _os
 # ──────────────────────────────────────────────────────────────────────────────
 # Known EMV Certification Authority (CA) Public Keys
 # These are the ROOT public keys published by card networks.
-# In production you'd load these from an HSM or certified terminal database.
+# Load from a JSON file with --ca-keys, or the tool will attempt to read
+# Issuer/ICC key data without full chain validation.
 # Key index structure: { RID: { key_index: (modulus_hex, exponent_hex) } }
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Global verbose flag
+VERBOSE = False
+
+def vprint(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
 
 # RID = first 5 bytes of AID (Application Identifier)
 KNOWN_RIDS = {
@@ -189,11 +197,13 @@ class CardInterface:
 
     def send(self, apdu: list[int], description: str = "") -> bytes:
         """Send APDU, return response data (raises on non-9000)."""
+        vprint(f"    APDU >> {' '.join(f'{b:02X}' for b in apdu)}")
         resp, sw1, sw2 = self.connection.transmit(apdu)
         # Handle GET RESPONSE
         if sw1 == 0x61:
             get_resp = [0x00, 0xC0, 0x00, 0x00, sw2]
             resp, sw1, sw2 = self.connection.transmit(get_resp)
+        vprint(f"    APDU << {' '.join(f'{b:02X}' for b in resp)} SW={sw1:02X}{sw2:02X}")
         if (sw1, sw2) != (0x90, 0x00):
             status = sw_to_str(sw1, sw2)
             raise APDUError(f"{description or 'APDU'} failed: {status}")
@@ -201,10 +211,22 @@ class CardInterface:
 
     def send_soft(self, apdu: list[int]) -> tuple[bytes, int, int]:
         """Send APDU, return (data, sw1, sw2) without raising."""
+        vprint(f"    APDU >> {' '.join(f'{b:02X}' for b in apdu)}")
         resp, sw1, sw2 = self.connection.transmit(apdu)
+        # Handle GET RESPONSE (61 xx)
         if sw1 == 0x61:
             get_resp = [0x00, 0xC0, 0x00, 0x00, sw2]
             resp, sw1, sw2 = self.connection.transmit(get_resp)
+        # Handle wrong Le (6C xx) — retry with the correct Le value
+        elif sw1 == 0x6C:
+            correct_le = sw2
+            retry_apdu = apdu[:-1] + [correct_le]
+            vprint(f"    APDU >> {' '.join(f'{b:02X}' for b in retry_apdu)} (retry with Le={correct_le:#04x})")
+            resp, sw1, sw2 = self.connection.transmit(retry_apdu)
+            if sw1 == 0x61:
+                get_resp = [0x00, 0xC0, 0x00, 0x00, sw2]
+                resp, sw1, sw2 = self.connection.transmit(get_resp)
+        vprint(f"    APDU << {' '.join(f'{b:02X}' for b in resp)} SW={sw1:02X}{sw2:02X}")
         return bytes(resp), sw1, sw2
 
 
@@ -243,6 +265,7 @@ class EMVCard:
     def __init__(self, card: CardInterface):
         self.card = card
         self.data: dict[str, bytes] = {}  # tag -> value
+        self.raw_records: list[tuple[int, int, bytes]] = []  # (sfi, rec, raw_bytes)
         self.aid: bytes | None = None
         self.network: str = "Unknown"
         self.afl: list | None = None
@@ -324,10 +347,24 @@ class EMVCard:
         if (sw1, sw2) != (0x90, 0x00):
             return False
 
-        tlv = TLV.parse(data)
-        self.data.update(tlv)
+        # GPO can return Format 1 (tag 80: raw AIP+AFL) or Format 2 (tag 77: TLV)
+        afl_raw = None
+        if data and data[0] == 0x80:
+            # Format 1: tag 80, length byte, then [AIP(2)] + [AFL(variable)]
+            # Parse outer TLV to get the 80 value
+            tlv = TLV.parse(data)
+            raw80 = tlv.get('80')
+            if raw80 and len(raw80) >= 2:
+                aip_bytes = raw80[:2]
+                self.data['82'] = aip_bytes  # Store AIP under its proper tag
+                afl_raw = raw80[2:]
+                vprint(f"  GPO Format 1: AIP={aip_bytes.hex().upper()} AFL={afl_raw.hex().upper()}")
+        else:
+            # Format 2: TLV-encoded response (tag 77)
+            tlv = TLV.parse(data)
+            self.data.update(tlv)
+            afl_raw = tlv.get('94')
 
-        afl_raw = tlv.get('94')
         if afl_raw and len(afl_raw) % 4 == 0:
             self.afl = []
             for i in range(0, len(afl_raw), 4):
@@ -336,6 +373,7 @@ class EMVCard:
                 last     = afl_raw[i+2]
                 # offline = afl_raw[i+3]
                 self.afl.append((sfi, first, last))
+            vprint(f"  AFL entries: {self.afl}")
         return True
 
     def _build_pdol_data(self, pdol: bytes | None) -> list[int]:
@@ -357,26 +395,36 @@ class EMVCard:
 
     # ── READ RECORDS ──────────────────────────────────────────────────────────
 
-    def read_records(self) -> bool:
-        """Read all records indicated by AFL."""
-        if not self.afl:
-            # Try reading SFI 1, records 1-3 directly
-            for sfi in range(1, 6):
-                for rec in range(1, 5):
+    def read_records(self, scan_all_sfis: bool = False) -> bool:
+        """Read all records indicated by AFL, optionally brute-force all SFIs."""
+        afl_sfis = set()
+
+        if self.afl:
+            for sfi, first, last in self.afl:
+                afl_sfis.add(sfi)
+                p2 = (sfi << 3) | 4
+                for rec in range(first, last + 1):
+                    apdu = [0x00, 0xB2, rec, p2, 0x00]
+                    data, sw1, sw2 = self.card.send_soft(apdu)
+                    if (sw1, sw2) == (0x90, 0x00):
+                        vprint(f"  SFI {sfi} rec {rec}: {data.hex().upper()}")
+                        self.data.update(TLV.parse(data))
+                        self.raw_records.append((sfi, rec, data))
+
+        if scan_all_sfis or not self.afl:
+            # Brute-force SFIs 1-10, records 1-8 to find hidden data
+            sfis_to_scan = range(1, 11) if not self.afl else [s for s in range(1, 11) if s not in afl_sfis]
+            for sfi in sfis_to_scan:
+                for rec in range(1, 9):
                     p2 = (sfi << 3) | 4
                     apdu = [0x00, 0xB2, rec, p2, 0x00]
                     data, sw1, sw2 = self.card.send_soft(apdu)
                     if (sw1, sw2) == (0x90, 0x00):
+                        vprint(f"  SFI {sfi} rec {rec} [extra]: {data.hex().upper()}")
                         self.data.update(TLV.parse(data))
-            return True
-
-        for sfi, first, last in self.afl:
-            p2 = (sfi << 3) | 4
-            for rec in range(first, last + 1):
-                apdu = [0x00, 0xB2, rec, p2, 0x00]
-                data, sw1, sw2 = self.card.send_soft(apdu)
-                if (sw1, sw2) == (0x90, 0x00):
-                    self.data.update(TLV.parse(data))
+                        self.raw_records.append((sfi, rec, data))
+                    elif sw1 == 0x6A and sw2 == 0x83:
+                        break  # Record not found — no more records in this SFI
         return True
 
     # ── GET DATA (individual tags) ─────────────────────────────────────────────
@@ -394,19 +442,20 @@ class EMVCard:
 
     # ── FULL READ ──────────────────────────────────────────────────────────────
 
-    def read_all(self) -> bool:
+    def read_all(self, scan_all: bool = False) -> bool:
         """Perform full card read sequence."""
         if not self.select_application():
             return False
         self.get_processing_options()
-        self.read_records()
+        self.read_records(scan_all_sfis=scan_all)
 
-        # Try GET DATA for extra tags
-        for tag in [0x9F36, 0x9F13, 0x9F17, 0x9F4F]:
+        # Try GET DATA for extra tags (ATC, lower counter, PIN retry, log format)
+        for tag in [0x9F36, 0x9F13, 0x9F17, 0x9F4F, 0x9F2B, 0x9F32, 0x8F, 0x90]:
             val = self.get_data(tag)
             if val:
                 tag_hex = format(tag, '04X')
-                self.data[tag_hex] = val
+                if tag_hex not in self.data:
+                    self.data[tag_hex] = val
 
         return True
 
@@ -430,7 +479,7 @@ class EMVCard:
             'remainder': rem,
             'issuer_pk_cert': self.data.get('90'),
             'issuer_pk_exp': self.data.get('9F32'),
-            'issuer_pk_rem': self.data.get('9F35'),
+            'issuer_pk_rem': self.data.get('9F2B'),  # 9F2B = Issuer PK Remainder (not 9F35=Terminal Type)
             'ca_pk_index': self.data.get('8F'),
         }
 
@@ -486,6 +535,27 @@ class EMVCard:
         pin_enc_cert = self.data.get('9F2D')
         if pin_enc_cert:
             info['has_pin_encipherment_key'] = True
+
+        # Application Interchange Profile (tells us SDA/DDA/CDA support)
+        aip = self.data.get('82')
+        if aip and len(aip) >= 2:
+            aip_val = (aip[0] << 8) | aip[1]
+            info['aip'] = f"{aip.hex().upper()}"
+            info['supports_sda'] = bool(aip_val & 0x4000)
+            info['supports_dda'] = bool(aip_val & 0x2000)
+            info['supports_cda'] = bool(aip_val & 0x0100)
+
+        # Issuer PK cert presence (for SDA)
+        iss_cert = self.data.get('90')
+        if iss_cert:
+            info['has_issuer_pk_cert'] = True
+            info['issuer_pk_cert_len'] = len(iss_cert)
+
+        # Signed Static Application Data (SDA signature over card data)
+        ssad = self.data.get('93')
+        if ssad:
+            info['has_ssad'] = True
+            info['ssad_len'] = len(ssad)
 
         return info
 
@@ -808,8 +878,211 @@ def get_card_connection(reader_index: int = 0):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# EMV Tag Dictionary (for human-readable raw dump)
+# ──────────────────────────────────────────────────────────────────────────────
+
+EMV_TAGS = {
+    "42":   "Issuer Identification Number (IIN)",
+    "4F":   "Application Identifier (AID)",
+    "50":   "Application Label",
+    "56":   "Track 1 Data",
+    "57":   "Track 2 Equivalent Data",
+    "5A":   "Application PAN",
+    "5F20": "Cardholder Name",
+    "5F24": "Application Expiration Date",
+    "5F25": "Application Effective Date",
+    "5F28": "Issuer Country Code",
+    "5F2A": "Transaction Currency Code",
+    "5F2D": "Language Preference",
+    "5F30": "Service Code",
+    "5F34": "Application PAN Sequence Number",
+    "5F36": "Transaction Currency Exponent",
+    "6F":   "FCI Template",
+    "70":   "Record Template",
+    "77":   "Response Message Template Format 2",
+    "80":   "Response Message Template Format 1",
+    "82":   "Application Interchange Profile (AIP)",
+    "83":   "Command Template",
+    "84":   "Dedicated File Name",
+    "87":   "Application Priority Indicator",
+    "88":   "Short File Identifier (SFI)",
+    "8A":   "Authorisation Response Code",
+    "8C":   "CDOL1",
+    "8D":   "CDOL2",
+    "8E":   "CVM List",
+    "8F":   "CA Public Key Index",
+    "90":   "Issuer Public Key Certificate",
+    "91":   "Issuer Authentication Data",
+    "92":   "Issuer Public Key Remainder",
+    "93":   "Signed Static Application Data (SDA)",
+    "94":   "Application File Locator (AFL)",
+    "95":   "Terminal Verification Results",
+    "97":   "Transaction Certificate Data Object List (TDOL)",
+    "98":   "Transaction Certificate (TC) Hash Value",
+    "99":   "Transaction Personal Identification Number Data",
+    "9A":   "Transaction Date",
+    "9B":   "Transaction Status Information",
+    "9C":   "Transaction Type",
+    "9D":   "Directory Definition File Name",
+    "9F02": "Amount, Authorised",
+    "9F03": "Amount, Other",
+    "9F06": "Application Identifier (Terminal)",
+    "9F07": "Application Usage Control",
+    "9F08": "Application Version Number",
+    "9F09": "Application Version Number (Terminal)",
+    "9F0B": "Cardholder Name Extended",
+    "9F0D": "Issuer Action Code - Default",
+    "9F0E": "Issuer Action Code - Denial",
+    "9F0F": "Issuer Action Code - Online",
+    "9F10": "Issuer Application Data",
+    "9F11": "Issuer Code Table Index",
+    "9F12": "Application Preferred Name",
+    "9F13": "Last Online Application Transaction Counter Register",
+    "9F14": "Lower Consecutive Offline Limit",
+    "9F17": "Personal Identification Number (PIN) Try Counter",
+    "9F1A": "Terminal Country Code",
+    "9F1F": "Track 1 Discretionary Data",
+    "9F20": "Track 2 Discretionary Data",
+    "9F21": "Transaction Time",
+    "9F23": "Upper Consecutive Offline Limit",
+    "9F26": "Application Cryptogram",
+    "9F27": "Cryptogram Information Data",
+    "9F2B": "Issuer Public Key Remainder",
+    "9F2D": "ICC PIN Encipherment Public Key Certificate",
+    "9F2E": "ICC PIN Encipherment Public Key Exponent",
+    "9F2F": "ICC PIN Encipherment Public Key Remainder",
+    "9F32": "Issuer Public Key Exponent",
+    "9F34": "Cardholder Verification Method Results",
+    "9F35": "Terminal Type",
+    "9F36": "Application Transaction Counter (ATC)",
+    "9F37": "Unpredictable Number",
+    "9F38": "Processing Options Data Object List (PDOL)",
+    "9F3B": "Application Reference Currency",
+    "9F3C": "Transaction Reference Currency Code",
+    "9F3D": "Transaction Reference Currency Exponent",
+    "9F40": "Additional Terminal Capabilities",
+    "9F41": "Transaction Sequence Counter",
+    "9F42": "Application Currency Code",
+    "9F44": "Application Currency Exponent",
+    "9F45": "Data Authentication Code",
+    "9F46": "ICC Public Key Certificate",
+    "9F47": "ICC Public Key Exponent",
+    "9F48": "ICC Public Key Remainder",
+    "9F49": "DDOL",
+    "9F4A": "Static Data Authentication Tag List",
+    "9F4B": "Signed Dynamic Application Data (SDAD)",
+    "9F4C": "ICC Dynamic Number",
+    "9F4D": "Log Entry",
+    "9F4E": "Merchant Name and Location",
+    "9F4F": "Log Format",
+    "9F51": "Application Currency Code",
+    "9F53": "Consecutive Transaction Counter International Limit",
+    "9F54": "Cumulative Total Transaction Amount Limit",
+    "9F5C": "Cumulative Total Transaction Amount Upper Limit",
+    "9F72": "Consecutive Transaction Counter International Upper Limit",
+    "9F74": "VLP Issuer Authorisation Code",
+    "9F75": "Cumulative Total Transaction Amount Limit - Dual Currency",
+    "9F76": "Secondary Application Currency Code",
+    "A5":   "FCI Proprietary Template",
+    "BF0C": "FCI Issuer Discretionary Data",
+    "DF01": "Reference PIN",
+}
+
+
+def decode_tag_value(tag: str, value: bytes) -> str:
+    """Return a human-readable interpretation of a TLV value."""
+    tag = tag.upper()
+    # Try ASCII for text tags
+    text_tags = {"50", "5F20", "5F2D", "9F12", "9F4E"}
+    if tag in text_tags:
+        try:
+            return value.decode("ascii", errors="replace").strip()
+        except Exception:
+            pass
+    # Numeric tags (BCD)
+    num_tags = {"5A", "57", "9F02", "9F03", "9F1A", "9A", "9F21", "9B", "9F41"}
+    # Expiry: YYMMDD
+    if tag == "5F24" and len(value) == 3:
+        return f"20{value[0]:02d}-{value[1]:02d} (YY-MM)"
+    # AIP: 2 bytes bitfield
+    if tag == "82" and len(value) == 2:
+        aip = (value[0] << 8) | value[1]
+        flags = []
+        if aip & 0x4000: flags.append("SDA")
+        if aip & 0x2000: flags.append("DDA")
+        if aip & 0x1000: flags.append("Cardholder Verification")
+        if aip & 0x0800: flags.append("Terminal Risk Management")
+        if aip & 0x0400: flags.append("Issuer Authentication")
+        if aip & 0x0100: flags.append("CDA")
+        return f"{value.hex().upper()} [{', '.join(flags) or 'none'}]"
+    return value.hex().upper()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI Commands
 # ──────────────────────────────────────────────────────────────────────────────
+
+def cmd_raw(args):
+    """Dump all raw TLV data from the card."""
+    print("\n━━━ EMV Raw Card Dump ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    conn = get_card_connection(args.reader)
+    card_iface = CardInterface(conn)
+    emv = EMVCard(card_iface)
+    print("  Reading card (scanning all SFIs)...")
+    if not emv.read_all(scan_all=True):
+        print("  [ERROR] Failed to select application.")
+        sys.exit(1)
+
+    print(f"\n  Network: {emv.network}   AID: {emv.aid.hex().upper() if emv.aid else 'N/A'}")
+
+    if emv.raw_records:
+        print(f"\n  ─── Raw Records ({len(emv.raw_records)}) ───")
+        for sfi, rec, raw in emv.raw_records:
+            print(f"\n  SFI={sfi} REC={rec}  [{len(raw)} bytes]")
+            print(f"  {raw.hex().upper()}")
+
+    print(f"\n  ─── Parsed TLV Tags ({len(emv.data)}) ───\n")
+    for tag in sorted(emv.data.keys()):
+        value = emv.data[tag]
+        name = EMV_TAGS.get(tag, f"Unknown tag {tag}")
+        decoded = decode_tag_value(tag, value)
+        print(f"  [{tag:>4}] {name}")
+        print(f"         Raw:  {value.hex().upper()}  ({len(value)} bytes)")
+        if decoded != value.hex().upper():
+            print(f"         Val:  {decoded}")
+        print()
+
+    # Highlight PKI-relevant data
+    print("  ─── PKI-Relevant Data ───\n")
+    pki_tags = {
+        "8F":   "CA Public Key Index",
+        "90":   "Issuer PK Certificate",
+        "92":   "Issuer PK Remainder (tag 92)",
+        "93":   "Signed Static Application Data",
+        "9F2B": "Issuer PK Remainder (tag 9F2B)",
+        "9F32": "Issuer PK Exponent",
+        "9F46": "ICC Public Key Certificate",
+        "9F47": "ICC Public Key Exponent",
+        "9F48": "ICC Public Key Remainder",
+        "9F4B": "Signed Dynamic Application Data",
+        "9F2D": "ICC PIN Encipherment PK Certificate",
+        "9F2E": "ICC PIN Encipherment PK Exponent",
+        "9F2F": "ICC PIN Encipherment PK Remainder",
+    }
+    found_any = False
+    for tag, desc in pki_tags.items():
+        val = emv.data.get(tag)
+        if val:
+            found_any = True
+            print(f"  [PRESENT] {tag} = {desc}")
+            print(f"            {val.hex().upper()[:80]}{'...' if len(val) > 40 else ''}")
+            print()
+    if not found_any:
+        print("  [!] No PKI certificate or key tags found in card data.")
+        print("      This card likely uses SDA (Static Data Authentication) only.")
+        print("      SDA cards do not have an ICC-level RSA private key.")
+
 
 def cmd_info(args):
     """Read and display card information."""
@@ -823,7 +1096,7 @@ def cmd_info(args):
         card_iface = CardInterface(conn)
         emv = EMVCard(card_iface)
         print("  Reading card...")
-        if not emv.read_all():
+        if not emv.read_all(scan_all=True):
             print("  [ERROR] Failed to read card. Try --demo mode.")
             sys.exit(1)
         info = emv.get_info()
@@ -838,13 +1111,22 @@ def cmd_info(args):
     print(f"  Expiry:      {info.get('expiry', 'N/A')}")
     if info.get('app_label'):
         print(f"  App Label:   {info['app_label']}")
-    print(f"\n  ICC Public Key:  {'✓ Present' if info.get('has_icc_public_key') else '✗ Not available (SDA only)'}")
-    if info.get('icc_pk_cert_len'):
-        print(f"  Cert length:     {info['icc_pk_cert_len']} bytes")
+
+    print(f"\n  ─── Authentication Capabilities ───")
+    if 'aip' in info:
+        print(f"  AIP:          {info['aip']}")
+        print(f"  SDA support:  {'Yes' if info.get('supports_sda') else 'No'}")
+        print(f"  DDA support:  {'Yes' if info.get('supports_dda') else 'No'}")
+        print(f"  CDA support:  {'Yes' if info.get('supports_cda') else 'No'}")
+
+    print(f"\n  ─── PKI Data ───")
+    print(f"  Issuer PK Cert:  {'Present (' + str(info['issuer_pk_cert_len']) + ' bytes)' if info.get('has_issuer_pk_cert') else 'Not found'}")
+    print(f"  Signed Static:   {'Present (' + str(info['ssad_len']) + ' bytes)' if info.get('has_ssad') else 'Not found'}")
+    print(f"  ICC Public Key:  {'Present (' + str(info['icc_pk_cert_len']) + ' bytes)' if info.get('icc_pk_cert_len') else 'Not found (SDA only)'}")
     if info.get('ca_key_index') is not None:
-        print(f"  CA Key Index:    {info['ca_key_index']}")
+        print(f"  CA Key Index:    {info['ca_key_index']:#04x}")
     if info.get('has_pin_encipherment_key'):
-        print(f"  PIN Enc. Key:    ✓ Present")
+        print(f"  PIN Enc. Key:    Present")
     if info.get('icc_pk_modulus_bits'):
         print(f"  Key size:        {info['icc_pk_modulus_bits']} bits")
     if info.get('note'):
@@ -852,7 +1134,7 @@ def cmd_info(args):
     if info.get('demo_mode'):
         print(f"\n  [DEMO MODE — no real card used]")
 
-    if args.json:
+    if hasattr(args, 'json') and args.json:
         safe = {k: v for k, v in info.items() if not k.startswith('_') and not isinstance(v, bytes)}
         print("\n" + json.dumps(safe, indent=2))
 
@@ -1200,11 +1482,15 @@ Hardware: Any PC/SC compliant contact reader, or PC/SC NFC reader (ACR1252U, SCM
     parser.add_argument('--demo', action='store_true', help='Simulation mode (no card reader needed)')
     parser.add_argument('--reader', type=int, default=0, help='Reader index (default: 0)')
     parser.add_argument('--json', action='store_true', help='Also output raw JSON')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Show raw APDUs and TLV parsing')
 
     sub = parser.add_subparsers(dest='command', metavar='command')
 
     # info
     p_info = sub.add_parser('info', help='Read card identity and public key info')
+
+    # raw
+    p_raw = sub.add_parser('raw', help='Dump all raw TLV data from card (diagnostic)')
 
     # export
     p_exp = sub.add_parser('export', help='Export ICC public key as PEM')
@@ -1245,14 +1531,19 @@ Hardware: Any PC/SC compliant contact reader, or PC/SC NFC reader (ACR1252U, SCM
         parser.print_help()
         sys.exit(0)
 
+    # Set global verbose flag
+    global VERBOSE
+    VERBOSE = args.verbose
+
     dispatch = {
-        'info': cmd_info,
-        'export': cmd_export,
+        'info':    cmd_info,
+        'raw':     cmd_raw,
+        'export':  cmd_export,
         'encrypt': cmd_encrypt,
         'decrypt': cmd_decrypt,
-        'sign': cmd_sign,
-        'verify': cmd_verify,
-        'demo': cmd_demo,
+        'sign':    cmd_sign,
+        'verify':  cmd_verify,
+        'demo':    cmd_demo,
     }
 
     dispatch[args.command](args)
