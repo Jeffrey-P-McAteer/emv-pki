@@ -3,5 +3,6 @@ pyenv
 env
 card_pubkey.pem
 *.pem
+encrypted.json
 
 
