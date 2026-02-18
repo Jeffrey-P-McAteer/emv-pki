@@ -1348,13 +1348,14 @@ def encrypt_with_card_key(public_key_pem: bytes, plaintext: bytes) -> dict:
 
 
 
-def build_dol_data(dol: bytes) -> tuple[bytes, bytes]:
+def build_dol_data(dol: bytes, forced_un: bytes | None = None) -> tuple[bytes, bytes]:
     """
     Parse a Data Object List (DOL) and return (filled_data, unpredictable_number).
     Fills tag 9F37 (Unpredictable Number) with random bytes; other tags with zeros.
+    If forced_un is provided, uses it instead of random bytes for tag 9F37.
     Returns the DOL response data and the 4-byte unpredictable number used.
     """
-    un = _os.urandom(4)
+    un = forced_un if forced_un is not None else _os.urandom(4)
     result = []
     i = 0
     while i < len(dol):
@@ -1368,28 +1369,32 @@ def build_dol_data(dol: bytes) -> tuple[bytes, bytes]:
             break
         length = dol[i]; i += 1
         tag_hex = format(tag, 'X').zfill(4 if tag > 0xFF else 2)
-        if tag_hex == '9F37':  # Unpredictable Number → use our random bytes
+        if tag_hex == '9F37':  # Unpredictable Number → use our bytes
             result.extend(list(un[:length]))
         else:
             result.extend([0x00] * length)
     return bytes(result), un
 
 
-def sign_with_card(card: CardInterface, ddol: bytes | None = None) -> tuple[bytes | None, bytes]:
+def sign_with_card(card: CardInterface, ddol: bytes | None = None,
+                   forced_un: bytes | None = None) -> tuple[bytes | None, bytes]:
     """
     Use INTERNAL AUTHENTICATE (DDA) to get a Signed Dynamic Application Data (SDAD).
 
     The DDOL (Dynamic Data Object List) describes what data the terminal must provide.
     For most Visa DDA cards the DDOL is just tag 9F37 (Unpredictable Number, 4 bytes).
 
+    If forced_un is provided it is used as the Unpredictable Number instead of a random
+    value, allowing the caller to deterministically bind a message to the SDAD.
+
     Returns (sdad_bytes, auth_data) — auth_data includes the Unpredictable Number used,
     needed to verify the SDAD. Returns (None, auth_data) on failure.
     """
     if ddol:
-        auth_data, un = build_dol_data(ddol)
+        auth_data, un = build_dol_data(ddol, forced_un=forced_un)
     else:
         # Default: 4-byte Unpredictable Number (covers most Visa/MC DDA cards)
-        auth_data = un = _os.urandom(4)
+        auth_data = un = forced_un if forced_un is not None else _os.urandom(4)
 
     apdu = [0x00, 0x88, 0x00, 0x00, len(auth_data)] + list(auth_data) + [0x00]
     resp, sw1, sw2 = card.send_soft(apdu)
@@ -2021,6 +2026,28 @@ def cmd_sign(args):
     print("  Reading card and initiating DDA flow...")
     emv.read_all(scan_all=True)
 
+    info = emv.get_info()
+    cardholder = info.get('cardholder', '')
+    network = emv.network
+
+    if cardholder:
+        print(f"  Cardholder:  {cardholder}")
+
+    message = getattr(args, 'message', None) or ''
+
+    # Derive a deterministic Unpredictable Number from message + cardholder so
+    # the SDAD cryptographically binds the card to this specific message and
+    # identity.  SHA-256( message || NUL || cardholder ) → first 4 bytes.
+    # When no message is given we still bind the cardholder so it's always
+    # covered, using a random salt to keep each signature unique.
+    if message:
+        commitment_input = message.encode('utf-8') + b'\x00' + cardholder.encode('utf-8')
+        forced_un = hashlib.sha256(commitment_input).digest()[:4]
+        print(f"  Message:     {message!r}")
+        print(f"  Commitment:  SHA256(message + cardholder) → {forced_un.hex().upper()} (UN)")
+    else:
+        forced_un = None  # will use a random UN
+
     ddol = emv.data.get('9F49')  # DDOL from card
     if ddol:
         print(f"  DDOL: {ddol.hex().upper()}")
@@ -2028,7 +2055,7 @@ def cmd_sign(args):
         print("  DDOL: not present (using default: 4-byte Unpredictable Number)")
 
     print("  Requesting SDAD (INTERNAL AUTHENTICATE)...")
-    sig, auth_data = sign_with_card(card_iface, ddol)
+    sig, auth_data = sign_with_card(card_iface, ddol, forced_un=forced_un)
     if not sig:
         print("  [ERROR] Card did not respond to INTERNAL AUTHENTICATE.")
         print("  Check that the card supports DDA (AIP bit 13 must be set).")
@@ -2038,11 +2065,10 @@ def cmd_sign(args):
             print(f"  AIP = {aip.hex().upper()}: DDA={'Yes' if aip_val & 0x2000 else 'No'}")
         sys.exit(1)
 
-    # Get ICC public key for verification display
+    # Decode cert chain and embed ICC public key so verify works with no card
     rid = emv.aid[:5].hex().upper() if emv.aid else ''
     chain = decode_cert_chain(emv.data, rid)
     icc_pk_pem = chain.get('icc_public_key_pem')
-    network = emv.network
 
     print(f"\n  Auth data: {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
     print(f"  SDAD:      {sig.hex().upper()[:60]}...  ({len(sig)} bytes)")
@@ -2065,44 +2091,85 @@ def cmd_sign(args):
         'version': '1',
         'algorithm': 'EMV-DDA-INTERNAL-AUTHENTICATE',
         'network': network,
+        'cardholder': cardholder,
         'auth_data': auth_data.hex(),
         'sdad': sig_b64,
         'sdad_len': len(sig),
-        'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+        'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
     }
+    if message:
+        result['message'] = message
+    if icc_pk_pem:
+        result['icc_public_key_pem'] = icc_pk_pem.decode('ascii')
 
     out_path = args.output or "signature.json"
     with open(out_path, 'w') as f:
         json.dump(result, f, indent=2)
 
     print(f"\n  Saved to: {out_path}")
+    if icc_pk_pem:
+        print("  ICC public key embedded — verify requires no card or separate PEM.")
 
 
 def cmd_verify(args):
-    """Verify a card-generated signature."""
+    """Verify a card-generated signature (no card required)."""
     print("\n━━━ Verify Signature ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     if not args.signature:
         print("  Provide --signature sig.json")
         sys.exit(1)
-    if not args.pubkey:
-        print("  Provide --pubkey card_pubkey.pem")
-        sys.exit(1)
 
     with open(args.signature) as f:
         sig_bundle = json.load(f)
-    with open(args.pubkey, 'rb') as f:
-        pem = f.read()
+
+    # Resolve ICC public key: explicit --pubkey overrides embedded key in JSON
+    pubkey_path = getattr(args, 'pubkey', None)
+    if pubkey_path:
+        with open(pubkey_path, 'rb') as f:
+            pem = f.read()
+    elif sig_bundle.get('icc_public_key_pem'):
+        pem = sig_bundle['icc_public_key_pem'].encode('ascii')
+    else:
+        print("  No ICC public key available.")
+        print("  Provide --pubkey card.pem or re-sign with an updated version of this tool")
+        print("  (which embeds the key automatically).")
+        sys.exit(1)
 
     algorithm = sig_bundle.get('algorithm', '')
+    cardholder = sig_bundle.get('cardholder', '')
+    message    = sig_bundle.get('message', '')
+    timestamp  = sig_bundle.get('timestamp', '')
+    network    = sig_bundle.get('network', '')
 
     # EMV DDA format (from cmd_sign): verify SDAD against ICC public key
     if algorithm == 'EMV-DDA-INTERNAL-AUTHENTICATE' or 'sdad' in sig_bundle:
-        sdad = base64.b64decode(sig_bundle['sdad'])
+        sdad      = base64.b64decode(sig_bundle['sdad'])
         auth_data = bytes.fromhex(sig_bundle['auth_data'])
-        print(f"  Algorithm:  {algorithm}")
-        print(f"  Auth data:  {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
-        print(f"  SDAD:       {sdad.hex().upper()[:48]}...  ({len(sdad)} bytes)")
+
+        print(f"  Algorithm:   {algorithm}")
+        print(f"  Network:     {network}")
+        if cardholder:
+            print(f"  Cardholder:  {cardholder}")
+        if message:
+            print(f"  Message:     {message!r}")
+        if timestamp:
+            print(f"  Timestamp:   {timestamp}")
+        print(f"  Auth data:   {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
+        print(f"  SDAD:        {sdad.hex().upper()[:48]}...  ({len(sdad)} bytes)")
+
+        # If a message was signed, verify that auth_data is exactly the
+        # SHA-256 commitment derived from message + cardholder.
+        commitment_ok = None
+        if message:
+            commitment_input = message.encode('utf-8') + b'\x00' + cardholder.encode('utf-8')
+            expected_un = hashlib.sha256(commitment_input).digest()[:len(auth_data)]
+            commitment_ok = (auth_data == expected_un)
+            status = 'OK' if commitment_ok else 'FAIL'
+            print(f"\n  Commitment check: SHA256(message + cardholder)[:{len(auth_data)}] "
+                  f"= {expected_un.hex().upper()} → {status}")
+            if not commitment_ok:
+                print("  ✗ COMMITMENT MISMATCH — message or cardholder has been tampered with")
+                sys.exit(1)
 
         result = verify_sdad(sdad, auth_data, pem)
 
@@ -2122,6 +2189,8 @@ def cmd_verify(args):
 
         if hash_ok:
             print(f"\n  ✓ VERIFICATION PASSED")
+            if message and commitment_ok:
+                print(f"  ✓ Message authentically signed by cardholder: {cardholder!r}")
         else:
             print(f"\n  ✗ VERIFICATION FAILED: hash mismatch")
             sys.exit(1)
@@ -2338,8 +2407,10 @@ Examples:
   %(prog)s probe                              # Test all crypto APDUs the card supports
   %(prog)s encrypt --message "secret"         # Encrypt to card's ICC public key
   %(prog)s decrypt --input encrypted.json     # Decrypt via PSO:DECIPHER
-  %(prog)s sign --output sig.json             # Sign via INTERNAL AUTHENTICATE (DDA)
-  %(prog)s verify --signature sig.json --pubkey card.pem
+  %(prog)s sign --message "I approve this" --output sig.json  # Sign a message via DDA
+  %(prog)s sign --output sig.json             # Sign (no message) via INTERNAL AUTHENTICATE
+  %(prog)s verify --signature sig.json        # Verify (ICC key embedded in JSON)
+  %(prog)s verify --signature sig.json --pubkey card.pem      # Verify with explicit PEM
 
 Supported cards: Visa, Mastercard, Amex, Discover, JCB, UnionPay, Maestro, Interac
 Hardware: Any PC/SC compliant contact reader (ACR1252U, SCM, Identive, etc.)
@@ -2377,12 +2448,13 @@ Hardware: Any PC/SC compliant contact reader (ACR1252U, SCM, Identive, etc.)
 
     # sign
     p_sign = sub.add_parser('sign', help='Sign via INTERNAL AUTHENTICATE (DDA)')
+    p_sign.add_argument('--message', '-m', help='Arbitrary text message to sign')
     p_sign.add_argument('--output', '-o', help='Output signature JSON (default: signature.json)')
 
     # verify
     p_ver = sub.add_parser('verify', help='Verify an SDAD signature from sign command')
     p_ver.add_argument('--signature', '-s', required=True, help='Signature JSON file')
-    p_ver.add_argument('--pubkey', '-k', required=True, help='Card public key PEM')
+    p_ver.add_argument('--pubkey', '-k', help='Card public key PEM (optional if embedded in JSON)')
 
     args = parser.parse_args()
 
