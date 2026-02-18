@@ -10,6 +10,7 @@
 emv_pki.py - EMV Credit Card PKI Tool
 =====================================
 Uses EMV chip cards as hardware security tokens for PKI operations.
+All operations require a real card in the reader — no simulation mode.
 
 Supports: Visa, Mastercard, Amex, Discover, JCB, UnionPay, Maestro, Interac
 
@@ -20,12 +21,13 @@ Requirements:
 
 Commands:
   info      - Read card identity and public key
-  encrypt   - Encrypt data using the card's ICC public key
-  decrypt   - Decrypt data (card signs challenge, key derived from cert chain)
-  sign      - Use card to sign data via INTERNAL AUTHENTICATE
-  verify    - Verify a card-generated signature
-  export    - Export card's public key in PEM format
-  demo      - Demo mode with simulated card data (no reader needed)
+  raw       - Dump all raw TLV tags (diagnostic)
+  export    - Export card's ICC public key in PEM format
+  probe     - Exhaustive crypto APDU capability test (with full EMV context)
+  encrypt   - Encrypt data to the card's ICC public key (RSA-OAEP hybrid)
+  decrypt   - Decrypt using card's PSO:DECIPHER command
+  sign      - Use card to sign data via INTERNAL AUTHENTICATE (DDA)
+  verify    - Verify a card-generated SDAD signature
 """
 
 import sys
@@ -37,10 +39,9 @@ import argparse
 import binascii
 import datetime
 import base64
-from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Attempt to import smartcard libraries (optional – demo mode works without)
+# Smartcard library (required — no simulation mode)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from smartcard.System import readers
@@ -1345,56 +1346,6 @@ def encrypt_with_card_key(public_key_pem: bytes, plaintext: bytes) -> dict:
     }
 
 
-def decrypt_with_card_signing(card: CardInterface, encrypted_bundle: dict,
-                               public_key_pem: bytes) -> bytes | None:
-    """
-    Decryption using card's signing capability (INTERNAL AUTHENTICATE).
-
-    NOTE: EMV cards cannot directly decrypt RSA ciphertext — their private key
-    is used for signing only. This function implements a card-authenticated
-    key derivation scheme:
-
-    1. Generate a challenge
-    2. Card signs the challenge (INTERNAL AUTHENTICATE)
-    3. Derive AES key from the card's signature (HKDF-like)
-    4. Decrypt the payload
-
-    This is a PKI TRUST model, not standard EMV decryption.
-    For true RSA decryption, the card must support ISO 7816-8 DECIPHER command.
-    """
-    try:
-        # Try ISO 7816-8 PSO:DECIPHER first
-        encrypted_key = base64.b64decode(encrypted_bundle['encrypted_key'])
-        lc = len(encrypted_key) + 1
-        apdu = [0x00, 0x2A, 0x80, 0x86, lc, 0x00] + list(encrypted_key) + [0x00]
-        resp, sw1, sw2 = card.send_soft(apdu)
-
-        if (sw1, sw2) == (0x90, 0x00):
-            # Direct RSA decryption worked
-            aes_key = resp
-        else:
-            # Fallback: use INTERNAL AUTHENTICATE for key derivation
-            challenge = _os.urandom(8)
-            auth_apdu = [0x00, 0x88, 0x00, 0x00, len(challenge)] + list(challenge) + [0x00]
-            sig_resp, sw1, sw2 = card.send_soft(auth_apdu)
-
-            if (sw1, sw2) != (0x90, 0x00):
-                return None
-
-            # Derive AES key from signature + challenge using HKDF
-            ikm = sig_resp + challenge + base64.b64decode(encrypted_bundle['nonce'])
-            aes_key = hashlib.pbkdf2_hmac('sha256', ikm, b'emv-pki-v1', 10000, 32)
-            print("  [!] Using signature-derived key (card doesn't support DECIPHER)")
-
-        # Decrypt payload
-        nonce = base64.b64decode(encrypted_bundle['nonce'])
-        ciphertext = base64.b64decode(encrypted_bundle['ciphertext'])
-        aesgcm = AESGCM(aes_key[:32])
-        return aesgcm.decrypt(nonce, ciphertext, None)
-
-    except Exception as e:
-        print(f"  Decryption error: {e}")
-        return None
 
 
 def build_dol_data(dol: bytes) -> tuple[bytes, bytes]:
@@ -1526,110 +1477,6 @@ def verify_sdad(sdad: bytes, auth_data: bytes, icc_pk_pem: bytes) -> dict:
     except Exception as ex:
         return {'valid': False, 'error': str(ex)}
 
-
-def verify_card_signature(public_key_pem: bytes, data: bytes, signature: bytes) -> bool:
-    """Verify a signature created by the card's INTERNAL AUTHENTICATE."""
-    try:
-        pub_key = serialization.load_pem_public_key(public_key_pem)
-        digest = hashlib.sha1(data).digest()
-
-        # EMV uses raw RSA (no padding standard) — recover and check
-        n = pub_key.public_numbers().n
-        e = pub_key.public_numbers().e
-        sig_int = int.from_bytes(signature, 'big')
-        recovered_int = pow(sig_int, e, n)
-        key_len = (n.bit_length() + 7) // 8
-        recovered = recovered_int.to_bytes(key_len, 'big')
-
-        # Check EMV SDAD structure (header=0x6A, format=0x05, trailer=0xBC)
-        if recovered[0] == 0x6A and recovered[-1] == 0xBC:
-            # Extract dynamic data from SDAD (format 05)
-            hash_in_sdad = recovered[-21:-1]  # 20 bytes before 0xBC
-            return True  # Structure valid
-
-        # Also try PKCS1v15 verify (used by simulated cards and some real DDA cards)
-        try:
-            pub_key.verify(signature, data, padding.PKCS1v15(), hashes.SHA1())
-            return True
-        except Exception:
-            pass
-        return False
-    except Exception:
-        return False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Demo / Simulation Mode
-# ──────────────────────────────────────────────────────────────────────────────
-
-DEMO_KEY_PATH = Path(_os.path.expanduser("~/.emv_pki_demo_key.pem"))
-
-class SimulatedCard:
-    """
-    A simulated EMV card for testing without hardware.
-    Persists RSA key pair in ~/.emv_pki_demo_key.pem so encrypt/decrypt work across calls.
-    """
-
-    def __init__(self):
-        if DEMO_KEY_PATH.exists():
-            print("  [DEMO] Loading persisted simulated ICC RSA-2048 key pair...")
-            with open(DEMO_KEY_PATH, 'rb') as f:
-                self._private_key = serialization.load_pem_private_key(f.read(), password=None)
-        else:
-            print("  [DEMO] Generating simulated ICC RSA-2048 key pair (persisted for reuse)...")
-            self._private_key = rsa.generate_private_key(
-                public_exponent=65537,
-                key_size=2048,
-                backend=default_backend()
-            )
-            with open(DEMO_KEY_PATH, 'wb') as f:
-                f.write(self._private_key.private_bytes(
-                    serialization.Encoding.PEM,
-                    serialization.PrivateFormat.PKCS8,
-                    serialization.NoEncryption()
-                ))
-        self.network = "Visa (Simulated)"
-        self.pan = "4532015112830366"
-        self.cardholder = "DEMO CARDHOLDER"
-        self.expiry = "12/28"
-        self.aid = bytes.fromhex("A0000000031010")
-
-    def get_public_key_pem(self) -> bytes:
-        return self._private_key.public_key().public_bytes(
-            serialization.Encoding.PEM,
-            serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-
-    def sign(self, data: bytes) -> bytes:
-        return self._private_key.sign(data, padding.PKCS1v15(), hashes.SHA1())
-
-    def decrypt(self, ciphertext: bytes) -> bytes | None:
-        try:
-            return self._private_key.decrypt(
-                ciphertext,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
-                )
-            )
-        except Exception:
-            return None
-
-    def get_info(self) -> dict:
-        pub = self._private_key.public_key()
-        nums = pub.public_numbers()
-        return {
-            'network': self.network,
-            'aid': self.aid.hex().upper(),
-            'pan_masked': self.pan[:6] + '******' + self.pan[-4:],
-            'cardholder': self.cardholder,
-            'expiry': self.expiry,
-            'has_icc_public_key': True,
-            'icc_pk_modulus_bits': nums.n.bit_length(),
-            'icc_pk_exponent': nums.e,
-            'demo_mode': True
-        }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1894,22 +1741,18 @@ def cmd_info(args):
     print("\n━━━ EMV Card Info ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     chain = None
-    if args.demo:
-        sim = SimulatedCard()
-        info = sim.get_info()
-    else:
-        conn = get_card_connection(args.reader)
-        card_iface = CardInterface(conn)
-        emv = EMVCard(card_iface)
-        print("  Reading card...")
-        if not emv.read_all(scan_all=True):
-            print("  [ERROR] Failed to read card. Try --demo mode.")
-            sys.exit(1)
-        info = emv.get_info()
-        # Attempt full certificate chain decode
-        if emv.aid:
-            rid = emv.aid[:5].hex().upper()
-            chain = decode_cert_chain(emv.data, rid)
+    conn = get_card_connection(args.reader)
+    card_iface = CardInterface(conn)
+    emv = EMVCard(card_iface)
+    print("  Reading card...")
+    if not emv.read_all(scan_all=True):
+        print("  [ERROR] Failed to read card.")
+        sys.exit(1)
+    info = emv.get_info()
+    # Attempt full certificate chain decode
+    if emv.aid:
+        rid = emv.aid[:5].hex().upper()
+        chain = decode_cert_chain(emv.data, rid)
 
     print(f"\n  Network:     {info.get('network', 'Unknown')}")
     print(f"  AID:         {info.get('aid', 'N/A')}")
@@ -1951,8 +1794,6 @@ def cmd_info(args):
         print(f"  PIN Enc. Key:    Present")
     if info.get('note'):
         print(f"\n  Note: {info['note']}")
-    if info.get('demo_mode'):
-        print(f"\n  [DEMO MODE — no real card used]")
 
     if hasattr(args, 'json') and args.json:
         safe = {k: v for k, v in info.items() if not k.startswith('_') and not isinstance(v, bytes)}
@@ -1964,48 +1805,41 @@ def cmd_info(args):
 
 
 def cmd_export(args):
-    """Export card's public key in PEM format."""
+    """Export card's ICC public key in PEM format."""
     print("\n━━━ Export ICC Public Key ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    if args.demo:
-        sim = SimulatedCard()
-        pem = sim.get_public_key_pem()
-        pan_masked = sim.pan[:6] + '******' + sim.pan[-4:]
-        network = sim.network
-        key_info = "RSA-2048 (simulated)"
+    conn = get_card_connection(args.reader)
+    card_iface = CardInterface(conn)
+    emv = EMVCard(card_iface)
+    print("  Reading card...")
+    if not emv.read_all(scan_all=True):
+        print("  [ERROR] Failed to read card.")
+        sys.exit(1)
+
+    info = emv.get_info()
+    network = info.get('network', 'Unknown')
+    pan_masked = info.get('pan_masked', 'N/A')
+
+    rid = emv.aid[:5].hex().upper() if emv.aid else ''
+    chain = decode_cert_chain(emv.data, rid)
+
+    if chain.get('icc_public_key_pem'):
+        pem = chain['icc_public_key_pem']
+        icc_info = chain.get('icc_pk', {})
+        iss_info = chain.get('issuer_pk', {})
+        key_info = (f"RSA-{icc_info.get('modulus_bits','?')} "
+                    f"(Issuer: {iss_info.get('issuer_id','?')}, "
+                    f"CA index: {chain.get('ca_key_index', '?'):#04x})")
+        print(f"  Certificate chain decoded successfully.")
+        print(f"  Issuer PK: {iss_info.get('modulus_bits','?')}-bit, expires {iss_info.get('expiry','?')}")
+        print(f"  ICC    PK: {icc_info.get('modulus_bits','?')}-bit, expires {icc_info.get('expiry','?')}")
+    elif chain.get('error'):
+        print(f"  [ERROR] {chain['error']}")
+        print("  Cannot produce a cryptographically verified ICC public key.")
+        sys.exit(1)
     else:
-        conn = get_card_connection(args.reader)
-        card_iface = CardInterface(conn)
-        emv = EMVCard(card_iface)
-        print("  Reading card...")
-        if not emv.read_all(scan_all=True):
-            print("  [ERROR] Failed to read card.")
-            sys.exit(1)
-
-        info = emv.get_info()
-        network = info.get('network', 'Unknown')
-        pan_masked = info.get('pan_masked', 'N/A')
-
-        rid = emv.aid[:5].hex().upper() if emv.aid else ''
-        chain = decode_cert_chain(emv.data, rid)
-
-        if chain.get('icc_public_key_pem'):
-            pem = chain['icc_public_key_pem']
-            icc_info = chain.get('icc_pk', {})
-            iss_info = chain.get('issuer_pk', {})
-            key_info = (f"RSA-{icc_info.get('modulus_bits','?')} "
-                        f"(Issuer: {iss_info.get('issuer_id','?')}, "
-                        f"CA index: {chain.get('ca_key_index', '?'):#04x})")
-            print(f"  Certificate chain decoded successfully.")
-            print(f"  Issuer PK: {iss_info.get('modulus_bits','?')}-bit, expires {iss_info.get('expiry','?')}")
-            print(f"  ICC    PK: {icc_info.get('modulus_bits','?')}-bit, expires {icc_info.get('expiry','?')}")
-        elif chain.get('error'):
-            print(f"  [ERROR] {chain['error']}")
-            print("  Cannot produce a cryptographically verified ICC public key.")
-            sys.exit(1)
-        else:
-            print("  [ERROR] Certificate chain decode returned no key.")
-            sys.exit(1)
+        print("  [ERROR] Certificate chain decode returned no key.")
+        sys.exit(1)
 
     out_path = args.output or "card_pubkey.pem"
     with open(out_path, 'wb') as f:
@@ -2020,33 +1854,29 @@ def cmd_export(args):
 
 
 def cmd_encrypt(args):
-    """Encrypt data using card's public key."""
+    """Encrypt data to the card's ICC public key (RSA-OAEP hybrid)."""
     print("\n━━━ Encrypt Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # Load or get public key
-    if args.pubkey:
-        with open(args.pubkey, 'rb') as f:
-            pem = f.read()
-    elif args.demo:
-        sim = SimulatedCard()
-        pem = sim.get_public_key_pem()
-        print(f"  Using simulated card: {sim.cardholder} ({sim.network})")
-    else:
-        # Read card and decode cert chain to get ICC public key
-        conn = get_card_connection(args.reader)
-        card_iface = CardInterface(conn)
-        emv = EMVCard(card_iface)
-        print("  Reading card for public key...")
-        emv.read_all(scan_all=True)
-        rid = emv.aid[:5].hex().upper() if emv.aid else ''
-        chain = decode_cert_chain(emv.data, rid)
-        if not chain.get('icc_public_key_pem'):
-            print(f"  [ERROR] {chain.get('error', 'Could not recover ICC public key')}")
-            print("  Use --pubkey with an exported key file instead.")
-            sys.exit(1)
-        pem = chain['icc_public_key_pem']
-        icc_bits = chain.get('icc_pk', {}).get('modulus_bits', '?')
-        print(f"  ICC public key recovered from certificate chain (RSA-{icc_bits})")
+    # Read ICC public key live from card
+    conn = get_card_connection(args.reader)
+    card_iface = CardInterface(conn)
+    emv = EMVCard(card_iface)
+    print("  Reading card...")
+    emv.read_all(scan_all=True)
+
+    info = emv.get_info()
+    pan_masked = info.get('pan_masked', 'N/A')
+    network = info.get('network', 'Unknown')
+
+    rid = emv.aid[:5].hex().upper() if emv.aid else ''
+    chain = decode_cert_chain(emv.data, rid)
+    if not chain.get('icc_public_key_pem'):
+        print(f"  [ERROR] {chain.get('error', 'Could not recover ICC public key')}")
+        sys.exit(1)
+    pem = chain['icc_public_key_pem']
+    icc_bits = chain.get('icc_pk', {}).get('modulus_bits', '?')
+    print(f"  Card:     {pan_masked}  ({network})")
+    print(f"  ICC key:  RSA-{icc_bits} (from certificate chain)")
 
     # Get plaintext
     if args.input:
@@ -2062,6 +1892,7 @@ def cmd_encrypt(args):
 
     print(f"  Scheme: RSA-OAEP-SHA256 + AES-256-GCM (hybrid)")
     bundle = encrypt_with_card_key(pem, plaintext)
+    bundle['card_id'] = pan_masked  # so decrypt can verify card identity
 
     out_path = args.output or "encrypted.json"
     with open(out_path, 'w') as f:
@@ -2071,13 +1902,14 @@ def cmd_encrypt(args):
     print(f"  ✓ Saved to: {out_path}")
     print(f"\n  Bundle preview:")
     print(f"    scheme:        {bundle['scheme']}")
+    print(f"    card_id:       {bundle['card_id']}")
     print(f"    encrypted_key: {bundle['encrypted_key'][:40]}...")
     print(f"    nonce:         {bundle['nonce']}")
     print(f"    ciphertext:    {bundle['ciphertext'][:40]}...")
 
 
 def cmd_decrypt(args):
-    """Decrypt data using card (card's private key operation)."""
+    """Decrypt data using card's PSO:DECIPHER command (ISO 7816-8)."""
     print("\n━━━ Decrypt Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     if not args.input:
@@ -2087,30 +1919,84 @@ def cmd_decrypt(args):
     with open(args.input) as f:
         bundle = json.load(f)
 
-    print(f"  Scheme: {bundle.get('scheme', 'unknown')}")
+    print(f"  Scheme:  {bundle.get('scheme', 'unknown')}")
+    if bundle.get('card_id'):
+        print(f"  Card ID: {bundle['card_id']}")
 
-    if args.demo:
-        sim = SimulatedCard()
-        print(f"  Using simulated card: {sim.cardholder}")
-        encrypted_key = base64.b64decode(bundle['encrypted_key'])
-        aes_key = sim.decrypt(encrypted_key)
-        if not aes_key:
-            print("  [ERROR] Decryption failed (wrong key?)")
-            sys.exit(1)
-        nonce      = base64.b64decode(bundle['nonce'])
-        ciphertext = base64.b64decode(bundle['ciphertext'])
-        plaintext  = AESGCM(aes_key).decrypt(nonce, ciphertext, None)
+    # Establish full EMV context (required before PSO:DECIPHER)
+    conn = get_card_connection(args.reader)
+    card_iface = CardInterface(conn)
+    emv = EMVCard(card_iface)
+    print("  Initialising EMV context (SELECT → GPO → READ RECORDS)...")
+    if not emv.read_all(scan_all=False):
+        print("  [ERROR] Failed to initialise card.")
+        sys.exit(1)
+
+    info = emv.get_info()
+    pan_masked = info.get('pan_masked', 'N/A')
+    print(f"  Card:    {pan_masked}  ({info.get('network', 'Unknown')})")
+
+    # Verify card identity matches the bundle (advisory)
+    if bundle.get('card_id') and bundle['card_id'] != pan_masked:
+        print(f"  [WARN] Bundle card_id {bundle['card_id']} does not match this card {pan_masked}")
+
+    encrypted_key = base64.b64decode(bundle['encrypted_key'])
+
+    # ISO 7816-8 PSO:DECIPHER:
+    #   CLA=00 INS=2A P1=80 P2=86
+    #   Data = 0x00 (padding indicator: OAEP) || RSA-encrypted-AES-key
+    #   Le = 00 (all bytes)
+    padding_indicator = [0x00]
+    data_field = padding_indicator + list(encrypted_key)
+    lc = len(data_field)
+
+    # Extended length may be needed for large keys
+    if lc <= 255:
+        apdu = [0x00, 0x2A, 0x80, 0x86, lc] + data_field + [0x00]
     else:
-        conn = get_card_connection(args.reader)
-        card_iface = CardInterface(conn)
-        emv = EMVCard(card_iface)
-        emv.read_all()
-        pem_path = args.pubkey
-        pem = open(pem_path, 'rb').read() if pem_path else b""
-        plaintext = decrypt_with_card_signing(card_iface, bundle, pem)
-        if not plaintext:
-            print("  [ERROR] Decryption failed.")
-            sys.exit(1)
+        # Extended APDU: 00 2A 80 86 00 [Lc_hi] [Lc_lo] [data] 00 00
+        apdu = ([0x00, 0x2A, 0x80, 0x86, 0x00, (lc >> 8) & 0xFF, lc & 0xFF]
+                + data_field + [0x00, 0x00])
+
+    print(f"  Sending PSO:DECIPHER  ({lc} bytes data field, key={len(encrypted_key)} bytes)...")
+    resp, sw1, sw2 = card_iface.send_soft(apdu)
+    sw = (sw1 << 8) | sw2
+
+    _SW_NAMES = {
+        0x9000: "Success",
+        0x6D00: "Instruction not supported (card does not implement PSO:DECIPHER)",
+        0x6A81: "Function not supported",
+        0x6985: "Conditions of use not satisfied (transaction context required?)",
+        0x6982: "Security status not satisfied (PIN required?)",
+        0x6984: "Referenced data not usable",
+        0x6800: "Function in CLA not supported",
+        0x6700: "Wrong length (Lc/Le incorrect)",
+    }
+    sw_desc = _SW_NAMES.get(sw, "Unknown status")
+    print(f"  PSO:DECIPHER response: SW={sw1:02X}{sw2:02X}  ({sw_desc})")
+    if resp:
+        print(f"  Response data: {bytes(resp).hex().upper()}")
+
+    if sw != 0x9000:
+        print(f"\n  ✗ Decryption failed — SW={sw1:02X}{sw2:02X}")
+        print(f"  This card does not support RSA decryption via PSO:DECIPHER.")
+        print(f"  The card's private key is accessible only through INTERNAL AUTHENTICATE (signing).")
+        print(f"  Run `probe` to see a full capability report.")
+        sys.exit(1)
+
+    # Card returned the decrypted AES key
+    aes_key = bytes(resp)
+    if len(aes_key) < 32:
+        print(f"  [ERROR] Decrypted key too short ({len(aes_key)} bytes, expected ≥32)")
+        sys.exit(1)
+
+    nonce      = base64.b64decode(bundle['nonce'])
+    ciphertext = base64.b64decode(bundle['ciphertext'])
+    try:
+        plaintext = AESGCM(aes_key[:32]).decrypt(nonce, ciphertext, None)
+    except Exception as e:
+        print(f"  [ERROR] AES-GCM decryption failed: {e}")
+        sys.exit(1)
 
     out_path = args.output
     if out_path:
@@ -2126,47 +2012,37 @@ def cmd_decrypt(args):
 
 
 def cmd_sign(args):
-    """Sign data using card's INTERNAL AUTHENTICATE."""
+    """Sign data using card's INTERNAL AUTHENTICATE (DDA)."""
     print("\n━━━ Sign Data with Card ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    if args.demo:
-        sim = SimulatedCard()
-        data = (args.message or "Authenticate this device").encode('utf-8') if not args.input else open(args.input, 'rb').read()
-        print(f"  Signing with simulated card ({sim.network})...")
-        sig = sim.sign(data)
-        auth_data = b''
-        icc_pk_pem = sim.get_public_key_pem()
-        network = sim.network
+    conn = get_card_connection(args.reader)
+    card_iface = CardInterface(conn)
+    emv = EMVCard(card_iface)
+    print("  Reading card and initiating DDA flow...")
+    emv.read_all(scan_all=True)
+
+    ddol = emv.data.get('9F49')  # DDOL from card
+    if ddol:
+        print(f"  DDOL: {ddol.hex().upper()}")
     else:
-        conn = get_card_connection(args.reader)
-        card_iface = CardInterface(conn)
-        emv = EMVCard(card_iface)
-        print("  Reading card and initiating DDA flow...")
-        emv.read_all(scan_all=True)
+        print("  DDOL: not present (using default: 4-byte Unpredictable Number)")
 
-        ddol = emv.data.get('9F49')  # DDOL from card
-        if ddol:
-            print(f"  DDOL: {ddol.hex().upper()}")
-        else:
-            print("  DDOL: not present (using default: 4-byte Unpredictable Number)")
+    print("  Requesting SDAD (INTERNAL AUTHENTICATE)...")
+    sig, auth_data = sign_with_card(card_iface, ddol)
+    if not sig:
+        print("  [ERROR] Card did not respond to INTERNAL AUTHENTICATE.")
+        print("  Check that the card supports DDA (AIP bit 13 must be set).")
+        aip = emv.data.get('82')
+        if aip and len(aip) >= 2:
+            aip_val = (aip[0] << 8) | aip[1]
+            print(f"  AIP = {aip.hex().upper()}: DDA={'Yes' if aip_val & 0x2000 else 'No'}")
+        sys.exit(1)
 
-        print("  Requesting SDAD (INTERNAL AUTHENTICATE)...")
-        sig, auth_data = sign_with_card(card_iface, ddol)
-        if not sig:
-            print("  [ERROR] Card did not respond to INTERNAL AUTHENTICATE.")
-            print("  Check that the card supports DDA (AIP bit 13 must be set).")
-            aip = emv.data.get('82')
-            if aip and len(aip) >= 2:
-                aip_val = (aip[0] << 8) | aip[1]
-                print(f"  AIP = {aip.hex().upper()}: DDA={'Yes' if aip_val & 0x2000 else 'No'}")
-            sys.exit(1)
-
-        # Get ICC public key for verification display
-        rid = emv.aid[:5].hex().upper() if emv.aid else ''
-        chain = decode_cert_chain(emv.data, rid)
-        icc_pk_pem = chain.get('icc_public_key_pem')
-        network = emv.network
-        data = auth_data  # The auth_data IS the signed data (DDOL response)
+    # Get ICC public key for verification display
+    rid = emv.aid[:5].hex().upper() if emv.aid else ''
+    chain = decode_cert_chain(emv.data, rid)
+    icc_pk_pem = chain.get('icc_public_key_pem')
+    network = emv.network
 
     print(f"\n  Auth data: {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
     print(f"  SDAD:      {sig.hex().upper()[:60]}...  ({len(sig)} bytes)")
@@ -2251,79 +2127,198 @@ def cmd_verify(args):
             sys.exit(1)
         return
 
-    # Legacy format using 'signature' field
-    if 'signature' not in sig_bundle:
-        print(f"  Unknown signature format (algorithm={algorithm!r})")
+    print(f"  Unknown signature format (algorithm={algorithm!r})")
+    print("  Only EMV-DDA-INTERNAL-AUTHENTICATE signatures are supported.")
+    sys.exit(1)
+
+
+def cmd_probe(args):
+    """
+    Exhaustive cryptographic APDU capability probe.
+
+    Initialises a full EMV transaction context (SELECT → GPO → READ RECORDS)
+    then systematically tests every crypto-relevant APDU and reports the
+    SW status code and any response data.  Use this to discover what private-key
+    operations the card actually exposes.
+    """
+    print("\n━━━ EMV Crypto Capability Probe ━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    conn = get_card_connection(args.reader)
+    card_iface = CardInterface(conn)
+    emv = EMVCard(card_iface)
+
+    print("  Step 1: Full EMV initialisation (SELECT → GPO → READ RECORDS)...")
+    if not emv.read_all(scan_all=False):
+        print("  [ERROR] Failed to select application — cannot continue probe.")
         sys.exit(1)
 
-    sig = base64.b64decode(sig_bundle['signature'])
+    info = emv.get_info()
+    aip = emv.data.get('82', b'')
+    aip_val = (aip[0] << 8) | aip[1] if len(aip) >= 2 else 0
+    print(f"  Network: {info.get('network','?')}   AID: {emv.aid.hex().upper() if emv.aid else 'N/A'}")
+    print(f"  AIP: {aip.hex().upper() if aip else 'N/A'}  "
+          f"SDA={'Y' if aip_val&0x4000 else 'N'} "
+          f"DDA={'Y' if aip_val&0x2000 else 'N'} "
+          f"CVM={'Y' if aip_val&0x1000 else 'N'} "
+          f"CDA={'Y' if aip_val&0x0100 else 'N'}")
+    print(f"  ATC: {emv.data.get('9F36', b'').hex().upper() or 'N/A'}")
 
-    if args.input:
-        with open(args.input, 'rb') as f:
-            data = f.read()
-    elif args.message:
-        data = args.message.encode('utf-8')
-    else:
-        print("  Provide original data with --input or --message")
-        sys.exit(1)
+    # Build CDOL1 data for GENERATE AC (fill with zeros for each required tag)
+    cdol1 = emv.data.get('8C', b'')
+    cdol2 = emv.data.get('8D', b'')
+    if cdol1:
+        print(f"  CDOL1: {cdol1.hex().upper()}")
+    if cdol2:
+        print(f"  CDOL2: {cdol2.hex().upper()}")
 
-    actual_digest = hashlib.sha1(data).hexdigest()
-    expected_digest = sig_bundle.get('data_sha1', '')
+    def _cdol_dummy(cdol: bytes) -> bytes:
+        """Build a zero-filled DOL response for probing."""
+        out = b''
+        i = 0
+        while i < len(cdol):
+            tag = cdol[i]
+            if tag & 0x1F == 0x1F:
+                i += 1
+                tag = (tag << 8) | cdol[i]
+            i += 1
+            length = cdol[i]
+            i += 1
+            out += bytes(length)
+        return out
 
-    print(f"  Data SHA-1 (actual):   {actual_digest}")
-    print(f"  Data SHA-1 (recorded): {expected_digest}")
+    cdol1_data = _cdol_dummy(cdol1) if cdol1 else bytes(29)  # typical CDOL1 length
+    cdol2_data = _cdol_dummy(cdol2) if cdol2 else bytes(16)
 
-    digest_match = actual_digest == expected_digest
-    sig_valid = verify_card_signature(pem, data, sig)
+    print(f"\n  Step 2: Probing crypto APDUs...\n")
+    print(f"  {'Command':<38} {'SW':>6}  Response / Notes")
+    print(f"  {'─'*38} {'─'*6}  {'─'*30}")
 
-    print(f"\n  Digest match: {'✓' if digest_match else '✗'}")
-    print(f"  Signature:    {'✓ Valid' if sig_valid else '✗ Invalid (or SDA card)'}")
+    _SW_NAMES = {
+        0x9000: "OK",
+        0x6D00: "INS not supported",
+        0x6A81: "Function not supported",
+        0x6985: "Conditions of use not satisfied",
+        0x6982: "Security status not satisfied",
+        0x6984: "Referenced data not usable",
+        0x6800: "CLA function not supported",
+        0x6700: "Wrong length",
+        0x6300: "Verification failed",
+        0x63C0: "PIN try limit reached",
+        0x6283: "Selected file invalid (card blocked?)",
+    }
 
-    if digest_match and sig_valid:
-        print(f"\n  ✓ VERIFICATION PASSED")
-    elif digest_match:
-        print(f"\n  ⚠ Data matches but signature structure differs (SDA card?)")
-    else:
-        print(f"\n  ✗ VERIFICATION FAILED")
+    def probe(label: str, apdu: list) -> tuple[int, bytes]:
+        resp, sw1, sw2 = card_iface.send_soft(apdu)
+        sw = (sw1 << 8) | sw2
+        sw_name = _SW_NAMES.get(sw, _SW_NAMES.get(sw & 0xFFF0, f"SW={sw1:02X}{sw2:02X}"))
+        data_str = bytes(resp).hex().upper()[:32] + ('...' if len(resp) > 16 else '') if resp else ''
+        status_str = f"{sw1:02X}{sw2:02X}"
+        note = f"{sw_name}" + (f"  data={data_str}" if data_str else '')
+        print(f"  {label:<38} {status_str:>6}  {note}")
+        return sw, bytes(resp)
 
+    # ── RSA / ISO 7816-8 PSO operations ─────────────────────────────────────
 
-def cmd_demo(args):
-    """Full demo walkthrough."""
-    print("""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  EMV PKI Tool — Full Demo Walkthrough
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PSO:DECIPHER — try with and without padding indicator byte
+    enc_key_dummy = bytes(144)  # 1152-bit key = 144 bytes (matches this card's ICC key size)
+    probe("PSO:DECIPHER (0x00 + 144b zeros)",
+          [0x00, 0x2A, 0x80, 0x86, 0x91, 0x00] + list(enc_key_dummy) + [0x00])
 
-Running full PKI workflow with simulated card...
-""")
-    import subprocess, shlex
+    probe("PSO:DECIPHER (144b, no padding byte)",
+          [0x00, 0x2A, 0x80, 0x86, 0x90] + list(enc_key_dummy) + [0x00])
 
-    base = [sys.executable, __file__, '--demo']
-    steps = [
-        ("1. Read card info",          base + ['info']),
-        ("2. Export public key",       base + ['export', '--output', '/tmp/demo_pubkey.pem']),
-        ("3. Encrypt a message",       base + ['encrypt', '--pubkey', '/tmp/demo_pubkey.pem',
-                                               '--message', 'Hello from the PKI demo! This is a secret.',
-                                               '--output', '/tmp/demo_encrypted.json']),
-        ("4. Decrypt the message",     base + ['decrypt', '--input', '/tmp/demo_encrypted.json']),
-        ("5. Sign some data",          base + ['sign', '--message', 'Authenticate this device',
-                                               '--output', '/tmp/demo_sig.json']),
-        ("6. Verify signature",        base + ['verify', '--signature', '/tmp/demo_sig.json',
-                                               '--pubkey', '/tmp/demo_pubkey.pem',
-                                               '--message', 'Authenticate this device']),
+    # Shorter test — some cards only accept modulus-length input
+    enc_key_short = bytes(128)  # 1024-bit
+    probe("PSO:DECIPHER (128b zeros)",
+          [0x00, 0x2A, 0x80, 0x86, 0x81, 0x00] + list(enc_key_short) + [0x00])
+
+    # PSO:ENCIPHER
+    probe("PSO:ENCIPHER (4b test)",
+          [0x00, 0x2A, 0x86, 0x80, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0x00])
+
+    # PSO:COMPUTE DIGITAL SIGNATURE (sign a pre-computed hash)
+    probe("PSO:CDS (20b SHA-1 hash)",
+          [0x00, 0x2A, 0x9E, 0x9A, 0x14] + [0xAA]*20 + [0x00])
+
+    # PSO:HASH
+    probe("PSO:HASH (4b data)",
+          [0x00, 0x2A, 0x90, 0x80, 0x04, 0xDE, 0xAD, 0xBE, 0xEF, 0x00])
+
+    # PSO:VERIFY DIGITAL SIGNATURE
+    probe("PSO:VERIFY DS (4b)",
+          [0x00, 0x2A, 0x00, 0xA8, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0x00])
+
+    # ── Manage Security Environment ─────────────────────────────────────────
+
+    # MSE:SET AT for internal auth / sig (key ref 0x81 = ICC private key)
+    probe("MSE:SET AT sig key (B6, ref=81)",
+          [0x00, 0x22, 0x41, 0xB6, 0x06, 0x84, 0x01, 0x81, 0x80, 0x01, 0x01])
+    probe("PSO:CDS after MSE:B6 (20b hash)",
+          [0x00, 0x2A, 0x9E, 0x9A, 0x14] + [0xBB]*20 + [0x00])
+
+    # MSE:SET AT for decipher (key ref 0x81)
+    probe("MSE:SET AT decipher (B8, ref=81)",
+          [0x00, 0x22, 0x41, 0xB8, 0x06, 0x84, 0x01, 0x81, 0x80, 0x01, 0x01])
+    probe("PSO:DECIPHER after MSE:B8 (0x00+144b)",
+          [0x00, 0x2A, 0x80, 0x86, 0x91, 0x00] + list(enc_key_dummy) + [0x00])
+
+    # Restore SE
+    probe("MSE:RESTORE",
+          [0x00, 0x22, 0xF3, 0x00, 0x00])
+
+    # ── EMV Symmetric / GENERATE AC ────────────────────────────────────────
+
+    # GENERATE AC — ARQC (P1=0x80 = ARQC request)
+    lc = len(cdol1_data)
+    probe(f"GENERATE AC ARQC (CDOL1={lc}b zeros)",
+          [0x80, 0xAE, 0x80, 0x00, lc] + list(cdol1_data) + [0x00])
+
+    # GENERATE AC — TC (P1=0x40) uses CDOL2
+    lc2 = len(cdol2_data)
+    probe(f"GENERATE AC TC (CDOL2={lc2}b zeros)",
+          [0x80, 0xAE, 0x40, 0x00, lc2] + list(cdol2_data) + [0x00])
+
+    # ── PIN / CVM operations ────────────────────────────────────────────────
+
+    probe("GET CHALLENGE",
+          [0x00, 0x84, 0x00, 0x00, 0x00])
+
+    probe("VERIFY plain PIN (dummy 1234)",
+          [0x00, 0x20, 0x00, 0x80, 0x08,
+           0x24, 0x12, 0x34, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+
+    probe("VERIFY offline enc PIN (dummy)",
+          [0x00, 0x20, 0x00, 0x88, 0x08,
+           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+    # ── GET DATA tags ───────────────────────────────────────────────────────
+
+    get_data_tags = [
+        ("9F17", "PIN Try Counter"),
+        ("9F38", "PDOL"),
+        ("9F49", "DDOL"),
+        ("9F4F", "Log Format"),
+        ("9F68", "Card Additional Processes"),
+        ("9F6E", "Third Party Data"),
+        ("9F08", "Application Version"),
     ]
+    for tag_hex, tag_name in get_data_tags:
+        tag_b = bytes.fromhex(tag_hex)
+        probe(f"GET DATA {tag_hex} ({tag_name})",
+              [0x00, 0xCA, tag_b[0], tag_b[1], 0x00])
 
-    for label, cmd in steps:
-        print(f"\n{'─'*60}")
-        print(f"  {label}")
-        print(f"{'─'*60}")
-        result = subprocess.run(cmd, capture_output=False)
-        if result.returncode != 0:
-            print(f"  [Step failed with code {result.returncode}]")
+    # ── INTERNAL AUTHENTICATE (should work — sanity check) ──────────────────
 
-    print(f"\n{'━'*60}")
-    print("  Demo complete!")
-    print(f"{'━'*60}\n")
+    probe("INTERNAL AUTHENTICATE (4b random)",
+          [0x00, 0x88, 0x00, 0x00, 0x04] + list(_os.urandom(4)) + [0x00])
+
+    print(f"\n  ─── Summary ───")
+    print(f"  SW=9000 = command succeeded")
+    print(f"  SW=6D00 = instruction not supported (card never implements this)")
+    print(f"  SW=6A81 = function not supported")
+    print(f"  SW=6985 = conditions of use not satisfied (may need different context)")
+    print(f"  SW=6982 = security status not satisfied (PIN/CVM required)")
+    print(f"  Run with -v to see full APDU hex for each command.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2333,23 +2328,23 @@ Running full PKI workflow with simulated card...
 def main():
     parser = argparse.ArgumentParser(
         prog='emv_pki',
-        description='EMV Credit Card PKI Tool — Use chip cards as hardware security tokens',
+        description='EMV Credit Card PKI Tool — Uses chip cards as hardware security tokens.\nAll operations require a real card in the reader.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s info                          # Read card identity
-  %(prog)s export --output card.pem      # Export ICC public key
-  %(prog)s encrypt --pubkey card.pem --message "secret"
-  %(prog)s decrypt --input encrypted.json
-  %(prog)s sign --message "device-id-123" --output sig.json
-  %(prog)s verify --signature sig.json --pubkey card.pem --message "device-id-123"
-  %(prog)s --demo demo                   # Full demo without hardware
+  %(prog)s info                               # Read card identity and cert chain
+  %(prog)s raw                                # Dump all TLV tags (diagnostic)
+  %(prog)s export --output card.pem           # Export ICC public key as PEM
+  %(prog)s probe                              # Test all crypto APDUs the card supports
+  %(prog)s encrypt --message "secret"         # Encrypt to card's ICC public key
+  %(prog)s decrypt --input encrypted.json     # Decrypt via PSO:DECIPHER
+  %(prog)s sign --output sig.json             # Sign via INTERNAL AUTHENTICATE (DDA)
+  %(prog)s verify --signature sig.json --pubkey card.pem
 
 Supported cards: Visa, Mastercard, Amex, Discover, JCB, UnionPay, Maestro, Interac
-Hardware: Any PC/SC compliant contact reader, or PC/SC NFC reader (ACR1252U, SCM, etc.)
+Hardware: Any PC/SC compliant contact reader (ACR1252U, SCM, Identive, etc.)
 """)
 
-    parser.add_argument('--demo', action='store_true', help='Simulation mode (no card reader needed)')
     parser.add_argument('--reader', type=int, default=0, help='Reader index (default: 0)')
     parser.add_argument('--json', action='store_true', help='Also output raw JSON')
     parser.add_argument('--verbose', '-v', action='store_true', help='Show raw APDUs and TLV parsing')
@@ -2357,43 +2352,37 @@ Hardware: Any PC/SC compliant contact reader, or PC/SC NFC reader (ACR1252U, SCM
     sub = parser.add_subparsers(dest='command', metavar='command')
 
     # info
-    p_info = sub.add_parser('info', help='Read card identity and public key info')
+    sub.add_parser('info', help='Read card identity, AIP, and cert chain')
 
     # raw
-    p_raw = sub.add_parser('raw', help='Dump all raw TLV data from card (diagnostic)')
+    sub.add_parser('raw', help='Dump all raw TLV data from card (diagnostic)')
 
     # export
-    p_exp = sub.add_parser('export', help='Export ICC public key as PEM')
+    p_exp = sub.add_parser('export', help='Export ICC public key as PEM (via cert chain)')
     p_exp.add_argument('--output', '-o', help='Output PEM file (default: card_pubkey.pem)')
 
+    # probe
+    sub.add_parser('probe', help='Exhaustive crypto APDU capability probe (with full EMV context)')
+
     # encrypt
-    p_enc = sub.add_parser('encrypt', help='Encrypt data using card public key')
-    p_enc.add_argument('--pubkey', '-k', help='PEM public key file (use exported key)')
+    p_enc = sub.add_parser('encrypt', help='Encrypt data to card ICC public key (RSA-OAEP hybrid)')
     p_enc.add_argument('--input', '-i', help='Input file to encrypt')
-    p_enc.add_argument('--message', '-m', help='Message to encrypt')
+    p_enc.add_argument('--message', '-m', help='Message string to encrypt')
     p_enc.add_argument('--output', '-o', help='Output JSON bundle (default: encrypted.json)')
 
     # decrypt
-    p_dec = sub.add_parser('decrypt', help='Decrypt data using card private key')
+    p_dec = sub.add_parser('decrypt', help='Decrypt data using card PSO:DECIPHER')
     p_dec.add_argument('--input', '-i', required=True, help='Encrypted JSON bundle')
-    p_dec.add_argument('--pubkey', '-k', help='Public key PEM (for verification)')
     p_dec.add_argument('--output', '-o', help='Output decrypted file (default: stdout)')
 
     # sign
-    p_sign = sub.add_parser('sign', help='Sign data using card INTERNAL AUTHENTICATE')
-    p_sign.add_argument('--input', '-i', help='Input file to sign')
-    p_sign.add_argument('--message', '-m', help='Message to sign')
+    p_sign = sub.add_parser('sign', help='Sign via INTERNAL AUTHENTICATE (DDA)')
     p_sign.add_argument('--output', '-o', help='Output signature JSON (default: signature.json)')
 
     # verify
-    p_ver = sub.add_parser('verify', help='Verify a card-generated signature')
+    p_ver = sub.add_parser('verify', help='Verify an SDAD signature from sign command')
     p_ver.add_argument('--signature', '-s', required=True, help='Signature JSON file')
     p_ver.add_argument('--pubkey', '-k', required=True, help='Card public key PEM')
-    p_ver.add_argument('--input', '-i', help='Original data file')
-    p_ver.add_argument('--message', '-m', help='Original message')
-
-    # demo
-    p_demo = sub.add_parser('demo', help='Run full demo walkthrough (no hardware needed)')
 
     args = parser.parse_args()
 
@@ -2409,11 +2398,11 @@ Hardware: Any PC/SC compliant contact reader, or PC/SC NFC reader (ACR1252U, SCM
         'info':    cmd_info,
         'raw':     cmd_raw,
         'export':  cmd_export,
+        'probe':   cmd_probe,
         'encrypt': cmd_encrypt,
         'decrypt': cmd_decrypt,
         'sign':    cmd_sign,
         'verify':  cmd_verify,
-        'demo':    cmd_demo,
     }
 
     dispatch[args.command](args)
