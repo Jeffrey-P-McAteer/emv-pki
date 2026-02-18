@@ -4,5 +4,6 @@ env
 card_pubkey.pem
 *.pem
 encrypted.json
+signature.json
 
 
