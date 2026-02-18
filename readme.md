@@ -5,42 +5,94 @@ to sign messages and verify signatures.  The card's private key never leaves the
 chip — it is used only through the card's own INTERNAL AUTHENTICATE command.
 
 **All operations that touch the card require a real card in a reader.**
-Verification of an existing signature requires no card at all.
+Verification of an existing signature requires no card, no reader, and no
+OS-specific setup — send the `signature.json` file to anyone on any platform.
 
 ---
 
 ## Requirements
 
-- A PC/SC-compliant **contact** smart card reader (ACR1252U, SCM SCR3310, etc.)
-- Linux with `pcscd` running:
-  ```
-  sudo systemctl start pcscd
-  ```
-- Python 3.12+ with [uv](https://github.com/astral-sh/uv) — dependencies are
-  declared inline and installed automatically:
-  ```
-  pip install uv        # one-time
-  ```
+### Hardware
 
-No other setup is needed.  Run the script directly:
+A PC/SC-compliant **contact** smart card reader.  Any CCID-compliant USB reader
+works on all platforms without a vendor driver:
 
-```
+- ACS ACR38U, ACR39U, ACR1252U
+- HID Global OMNIKEY 3121
+- Identive / SCM SCR3310, SCR3500
+- Gemalto PC Twin Reader (install vendor driver for best results)
+
+The reader must be a **contact** type — standard payment cards have a gold chip
+on the front and are inserted face-up into the reader slot.
+
+### Python
+
+Python 3.12+ and [uv](https://astral.sh/uv).  Dependencies (`pyscard`,
+`cryptography`) are declared inline and installed automatically by `uv` on first
+run.
+
+---
+
+## Setup
+
+### Linux
+
+Install `uv`, start the PC/SC daemon, then run:
+
+```sh
+pip install uv                        # or: curl -LsSf https://astral.sh/uv/install.sh | sh
+sudo systemctl enable --now pcscd
 ./emv-pki.py <command> [options]
 ```
+
+If you see a polkit / "Access denied" error the script will automatically
+re-run itself with `sudo`.
+
+### Windows
+
+Windows includes a built-in smart card service (`SCardSvr`) that starts
+automatically when a reader is plugged in — no daemon or driver installation
+is needed for CCID-compliant readers.
+
+Install `uv` once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then run every command with `uv run`:
+
+```cmd
+uv run emv-pki.py <command> [options]
+```
+
+> **Note:** Windows does not execute the shebang line at the top of the script,
+> so `./emv-pki.py` will not work.  Always use `uv run emv-pki.py`.
+
+Standard interactive users can access the smart card reader without elevated
+privileges.  If you get an `SCARD_E_NO_SERVICE` error, plug in the reader and
+try again — the service starts on demand when a reader is detected.
 
 ---
 
 ## Card compatibility
 
-The sign command requires Dynamic Data Authentication (DDA), which gives the card
-a unique RSA private key per-chip.  Run `info` to check whether your card
+The sign command requires Dynamic Data Authentication (DDA), which gives the
+card a unique RSA private key per-chip.  Run `info` to check whether your card
 supports it:
 
+**Linux:**
+```sh
+./emv-pki.py info
 ```
-$ ./emv-pki.py info
+
+**Windows:**
+```cmd
+uv run emv-pki.py info
 ```
 
 ```
+━━━ EMV Card Info ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Network:     Visa
   AID:         A0000000031010
   Cardholder:  LAST/FIRST I
@@ -63,8 +115,14 @@ sign.
 
 Insert the card, then run:
 
-```
+**Linux:**
+```sh
 ./emv-pki.py sign --message "I approve this transaction" --output approval.json
+```
+
+**Windows:**
+```cmd
+uv run emv-pki.py sign --message "I approve this transaction" --output approval.json
 ```
 
 ```
@@ -126,10 +184,18 @@ CA → Issuer → ICC) is embedded in the JSON so the verifier needs nothing els
 
 ## Verifying a signature
 
-No card is needed.  The ICC public key is embedded in the signature bundle.
+No card, no reader, and no platform-specific setup is needed.  The ICC public
+key is embedded in the signature bundle.  Send `approval.json` to the recipient
+by any means (email, messaging, shared drive) and they verify it with:
 
-```
+**Linux:**
+```sh
 ./emv-pki.py verify --signature approval.json
+```
+
+**Windows:**
+```cmd
+uv run emv-pki.py verify --signature approval.json
 ```
 
 ```
@@ -167,21 +233,28 @@ fails before the SDAD is even checked:
 Older bundles (or bundles generated without an embedded key) can still be
 verified by passing the PEM file explicitly:
 
-```
-./emv-pki.py export --output card.pem          # requires card
+```sh
+# Linux — export requires card; verify does not
+./emv-pki.py export --output card.pem
 ./emv-pki.py verify --signature approval.json --pubkey card.pem
+```
+
+```cmd
+rem Windows
+uv run emv-pki.py export --output card.pem
+uv run emv-pki.py verify --signature approval.json --pubkey card.pem
 ```
 
 ---
 
 ## Signing without a message
 
-Omitting `--message` still signs, and still embeds the cardholder and ICC public
-key.  The Unpredictable Number is random, so each signature is unique and
-non-deterministic:
+Omitting `--message` still signs and still embeds the cardholder and ICC public
+key.  The Unpredictable Number is random, so each signature is unique:
 
-```
-./emv-pki.py sign --output sig.json
+```sh
+./emv-pki.py sign --output sig.json          # Linux
+uv run emv-pki.py sign --output sig.json     # Windows
 ```
 
 This is useful as a proof-of-card-presence timestamp rather than a message
@@ -193,8 +266,9 @@ attestation.
 
 To extract the card's RSA public key as a PEM file for use in other tools:
 
-```
-./emv-pki.py export --output card.pem
+```sh
+./emv-pki.py export --output card.pem          # Linux
+uv run emv-pki.py export --output card.pem      # Windows
 ```
 
 The key is recovered by decoding the full certificate chain embedded in the
@@ -207,7 +281,7 @@ card (CA → Issuer PK → ICC PK) using the publicly known EMV CA root keys.
 The tool can encrypt data **to** a card's ICC public key using a hybrid scheme
 (RSA-OAEP-SHA256 + AES-256-GCM):
 
-```
+```sh
 ./emv-pki.py encrypt --message "secret data" --output encrypted.json
 ./emv-pki.py encrypt --input file.txt --output encrypted.json
 ```
@@ -215,7 +289,7 @@ The tool can encrypt data **to** a card's ICC public key using a hybrid scheme
 Decryption requires the card to perform the RSA private operation via the
 ISO 7816-8 `PSO:DECIPHER` command:
 
-```
+```sh
 ./emv-pki.py decrypt --input encrypted.json
 ```
 
@@ -226,7 +300,7 @@ not satisfied).  The `sign` command works reliably because INTERNAL AUTHENTICATE
 is a standard DDA requirement.
 
 **Recommendation:** Use the card for signing only.  For encryption to a
-card-holder's identity, export the ICC public key (`export` command) and use a
+cardholder's identity, export the ICC public key (`export` command) and use a
 dedicated tool:
 
 - **age** — `age -r "$(ssh-keygen -e -f card.pem)"` — simple file encryption
@@ -243,17 +317,18 @@ identity, use the signature to authenticate and a conventional key exchange
 
 ## Other commands
 
-| Command | Description |
-|---------|-------------|
-| `info`  | Display network, cardholder, PAN (masked), expiry, AIP flags, and certificate chain decode status |
-| `raw`   | Dump every raw TLV tag read from the card — useful for diagnostics |
+| Command  | Description |
+|----------|-------------|
+| `info`   | Display network, cardholder, PAN (masked), expiry, AIP flags, and certificate chain decode status |
+| `raw`    | Dump every raw TLV tag read from the card — useful for diagnostics |
 | `export` | Export the ICC public key as a PEM file |
-| `probe` | Send every known crypto APDU and report the card's SW responses — shows exactly what the card supports |
+| `probe`  | Send every known crypto APDU and report the card's SW responses — shows exactly what the card supports |
 
 ### Probe example
 
-```
-./emv-pki.py probe
+```sh
+./emv-pki.py probe          # Linux
+uv run emv-pki.py probe     # Windows
 ```
 
 ```
@@ -271,10 +346,21 @@ identity, use the signature to authenticate and a conventional key exchange
 ## Global options
 
 ```
---reader N     Use reader at index N (default: 0). List readers with --verbose.
+--reader N     Use reader at index N (default: 0). Use --verbose to list available readers.
 --verbose, -v  Print raw APDUs and TLV parsing details.
 --json         Also emit raw JSON output at the end of info/export commands.
 ```
+
+---
+
+## Windows troubleshooting
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `SCARD_E_NO_SERVICE` or `SCARD_E_SERVICE_STOPPED` | The smart card service shut down after the last reader was removed | Plug in the reader and run the command again; the service restarts automatically |
+| `No module named 'smartcard'` | `uv` not used to run the script | Use `uv run emv-pki.py` instead of `python emv-pki.py` |
+| Reader not detected | Device still initialising after plug-in | Wait a few seconds for Windows to install the CCID driver, then retry |
+| Two readers visible (`--verbose`) | Reader has two slots or a contactless antenna | Use `--reader 0` or `--reader 1` to select the correct slot |
 
 ---
 
