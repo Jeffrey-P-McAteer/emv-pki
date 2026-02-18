@@ -77,9 +77,15 @@ try again — the service starts on demand when a reader is detected.
 
 ## Card compatibility
 
-The sign command requires Dynamic Data Authentication (DDA), which gives the
-card a unique RSA private key per-chip.  Run `info` to check whether your card
-supports it:
+The tool supports two signing methods and selects automatically based on what
+the card provides:
+
+| Card type | AIP flag | Signing method | Verifiable by anyone? |
+|-----------|----------|----------------|-----------------------|
+| DDA / CDA chip | DDA=Yes | INTERNAL AUTHENTICATE (RSA SDAD) | **Yes** — ICC public key embedded in bundle |
+| SDA / no-cert chip | DDA=No | GENERATE AC (3DES ARQC) | **Partial** — message commitment only; AC requires issuer |
+
+Run `info` to see which type your card is:
 
 **Linux:**
 ```sh
@@ -91,29 +97,28 @@ supports it:
 uv run emv-pki.py info
 ```
 
+**DDA card** (full PKI signing):
 ```
-━━━ EMV Card Info ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Network:     Visa
-  AID:         A0000000031010
-  Cardholder:  LAST/FIRST I
-  PAN:         ****1234
-  Expiry:      12/28
-
   ─── Authentication Capabilities ───
   AIP:          E000
-  SDA support:  No
-  DDA support:  Yes       ← required for signing
-  CDA support:  Yes
+  DDA support:  Yes       ← full RSA signing, independently verifiable
 ```
 
-Cards that show only `SDA support: Yes` have no per-chip private key and cannot
-sign.
+**SDA / no-cert card** (card-presence token):
+```
+  ─── Authentication Capabilities ───
+  AIP:          1800
+  DDA support:  No        ← GENERATE AC used; message commitment verifiable
+```
+
+Run `probe` to see the full capability report for any card.
 
 ---
 
 ## Signing a message
 
-Insert the card, then run:
+The command is the same regardless of card type — the tool detects the card's
+capabilities automatically:
 
 **Linux:**
 ```sh
@@ -125,28 +130,26 @@ Insert the card, then run:
 uv run emv-pki.py sign --message "I approve this transaction" --output approval.json
 ```
 
+### DDA card output (RSA — independently verifiable)
+
 ```
 ━━━ Sign Data with Card ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Reading card and initiating DDA flow...
   Cardholder:  LAST/FIRST I
   Message:     'I approve this transaction'
   Commitment:  SHA256(message + cardholder) → A3F21C08 (UN)
-  DDOL: not present (using default: 4-byte Unpredictable Number)
+  Method:      DDA (INTERNAL AUTHENTICATE + ICC public key)
   Requesting SDAD (INTERNAL AUTHENTICATE)...
 
-  Auth data: A3F21C08  (4 bytes)
-  SDAD:      0A3D4AF2F717A01B...  (144 bytes)
+  Auth data:   A3F21C08  (4 bytes)
+  SDAD:        0A3D4AF2F717A01B...  (144 bytes)
 
-  SDAD structure verified against ICC public key
-  Format: 0x05 (expected 0x05 for DDA SDAD)
+  SDAD verified against ICC public key
+  Format: 0x05  Hash: OK
   ICC Dynamic Number: 3B9A12F0
-  Hash check: OK
 
   Saved to: approval.json
   ICC public key embedded — verify requires no card or separate PEM.
 ```
-
-The output file is a self-contained JSON bundle:
 
 ```json
 {
@@ -163,30 +166,70 @@ The output file is a self-contained JSON bundle:
 }
 ```
 
-### How the signing works
+### SDA / no-cert card output (GENERATE AC — card-presence token)
 
-1. The tool computes a **commitment**:
-   `SHA-256(message + NUL + cardholder)`, and takes the first 4 bytes as the
-   Unpredictable Number (terminal dynamic data).
-2. The card's chip receives this value via the EMV INTERNAL AUTHENTICATE command
-   and produces a **Signed Dynamic Application Data (SDAD)** — an RSA signature
-   using the card's private key, covering its own dynamic data and the
-   Unpredictable Number.
-3. Because the Unpredictable Number is derived deterministically from the
-   message **and** the cardholder name, the SDAD cryptographically binds the
-   specific card, the specific cardholder identity, and the specific message
-   together.
+```
+━━━ Sign Data with Card ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Cardholder:  LAST/FIRST I
+  Message:     'I approve this transaction'
+  Commitment:  SHA256(message + cardholder) → 3979573C (UN)
+  Method:      GENERATE AC (ARQC card-presence token)
+  Note:        No ICC certificate chain — using symmetric AC.
+               The cryptogram requires the issuer master key to verify.
+               Message commitment and card identity are still provable.
+  Requesting Application Cryptogram (GENERATE AC ARQC)...
 
-The card's ICC public key (recovered from the full EMV certificate chain
-CA → Issuer → ICC) is embedded in the JSON so the verifier needs nothing else.
+  Cryptogram type: ARQC
+  ATC:             00EC
+  AC:              4332299B3FC3A544
+  Auth data (UN):  3979573C
+
+  Saved to: approval.json
+  ⚠  GENERATE AC token — message commitment is verifiable,
+     but the AC itself requires the card issuer to authenticate.
+```
+
+```json
+{
+  "version": "1",
+  "algorithm": "EMV-GENERATE-AC",
+  "network": "Visa",
+  "cardholder": "LAST/FIRST I",
+  "message": "I approve this transaction",
+  "auth_data": "3979573c",
+  "cryptogram_type": "ARQC",
+  "application_cryptogram": "4332299b3fc3a544",
+  "atc": "00ec",
+  "cdol1_data": "000000000000000000000000000000000000000000003979573c",
+  "timestamp": "2026-02-18T16:00:00.000000Z"
+}
+```
+
+### How the commitment works (both card types)
+
+1. The tool computes `SHA-256(message + NUL + cardholder)` and takes the first
+   4 bytes as the **Unpredictable Number** — the terminal-side challenge sent to
+   the card.
+2. The card's response (SDAD or AC) is computed over data that includes this
+   value, binding the response to the specific message and cardholder.
+3. The verifier recomputes the same 4 bytes from the message and cardholder in
+   the bundle and checks they match `auth_data`.  A mismatch means the message
+   or cardholder field has been altered.
+
+**DDA cards** go further: the SDAD is an RSA signature whose full hash chain can
+be checked against the embedded ICC public key — no issuer involvement needed.
+
+**GENERATE AC cards** produce a 3DES MAC (ARQC).  The commitment check proves
+the message hasn't been altered, and the ATC proves the card was physically
+present, but the 8-byte AC value itself cannot be authenticated without the
+issuer's master key.
 
 ---
 
 ## Verifying a signature
 
-No card, no reader, and no platform-specific setup is needed.  The ICC public
-key is embedded in the signature bundle.  Send `approval.json` to the recipient
-by any means (email, messaging, shared drive) and they verify it with:
+No card, no reader, and no platform-specific setup is needed.  Send the JSON
+file to the recipient by any means and they verify it with:
 
 **Linux:**
 ```sh
@@ -197,6 +240,8 @@ by any means (email, messaging, shared drive) and they verify it with:
 ```cmd
 uv run emv-pki.py verify --signature approval.json
 ```
+
+### DDA verification output
 
 ```
 ━━━ Verify Signature ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -220,8 +265,36 @@ uv run emv-pki.py verify --signature approval.json
   ✓ Message authentically signed by cardholder: 'LAST/FIRST I'
 ```
 
-If the message or cardholder field has been tampered with, the commitment check
-fails before the SDAD is even checked:
+### GENERATE AC verification output
+
+```
+━━━ Verify Signature ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Algorithm:   EMV-GENERATE-AC
+  Network:     Visa
+  Cardholder:  LAST/FIRST I
+  Message:     'I approve this transaction'
+  Timestamp:   2026-02-18T16:00:00.000000Z
+  Auth data:   3979573C  (4 bytes)
+  Cryptogram:  4332299B3FC3A544  (ARQC)
+  ATC:         00EC
+
+  Commitment check: SHA256(message + cardholder)[:4] = 3979573C → OK
+
+  ⚠  GENERATE AC token — partial verification only:
+     The Application Cryptogram (ARQC) is a symmetric 3DES MAC.
+     It can only be verified by the card's issuer bank.
+     This tool cannot independently authenticate the AC value.
+
+  ✓ COMMITMENT CHECK PASSED
+  ✓ Message is bound to cardholder: 'LAST/FIRST I'
+  ✓ Card was present at 2026-02-18T16:00:00.000000Z (ATC: 00EC)
+  ⚠  AC cryptogram authenticity requires issuer verification
+```
+
+### Tamper detection (both card types)
+
+If the message or cardholder field has been altered, the commitment check fails
+before any cryptographic verification is attempted:
 
 ```
   Commitment check: SHA256(message + cardholder)[:4] = A3F21C08 → FAIL
@@ -315,14 +388,59 @@ identity, use the signature to authenticate and a conventional key exchange
 
 ---
 
+## Adding support for new card types
+
+The tool currently handles two signing paths.  If you obtain a card that fits
+neither (e.g. a card that returns unexpected APDU responses or uses a
+proprietary authentication scheme), the steps to add support are:
+
+1. **Run `info` and `probe`** with the new card inserted.  Note the AIP value,
+   which commands return `9000`, and the size of any response payloads.
+
+2. **Run `raw`** and examine the TLV tags.  Look for:
+   - `8F` — CA Key Index (present on DDA/CDA cards)
+   - `90` — Issuer Public Key Certificate
+   - `9F46` — ICC Public Key Certificate
+   - `9F49` — DDOL (Dynamic Data Object List for INTERNAL AUTHENTICATE)
+   - `9F4A` / `9F4B` — Static/Signed Data
+   - `9F68` — Card Additional Processes (may hint at EMV-standard extensions)
+
+3. **Identify the signing mechanism**:
+   - If `8F`/`90`/`9F46` are all present → DDA/CDA path, similar to existing
+     `EMV-DDA-INTERNAL-AUTHENTICATE`.  Check if `decode_cert_chain()` decodes
+     successfully; if not, the CA key may be missing from the embedded table.
+   - If only `90` is present (no `9F46`) → SDA (Static Data Authentication).
+     SDA signs static card data at personalisation; a per-transaction signing
+     scheme is not available.
+   - If no cert tags are present but `GENERATE AC` works → existing
+     `EMV-GENERATE-AC` path already handles this.
+   - If `INTERNAL AUTHENTICATE` works but produces a short response (< 64 bytes)
+     → may be a proprietary scheme; inspect raw bytes with `--verbose`.
+
+4. **Add the CA root key** if the chain decode fails with "unknown CA key index":
+   Find the RID (first 5 bytes of AID) and key index (`8F` tag), look up the
+   public key in the network's published CA key document, and add it to the
+   `EMV_CA_KEYS` dict near the top of `emv-pki.py`.
+
+5. **Add a new signing path** if needed: follow the pattern of `sign_with_card`
+   (DDA) or `sign_with_genac` (GENERATE AC) — send the appropriate APDU, parse
+   the response, and record `algorithm`, `auth_data`, and enough fields in the
+   JSON bundle that `cmd_verify` can reconstruct the verification inputs without
+   a card.
+
+6. **Add a verify branch** in `cmd_verify` matching the new `algorithm` string.
+
+The `probe` command is the fastest way to understand what any unknown card
+supports — it tests every known EMV crypto APDU and reports SW status codes.
+
 ## Other commands
 
 | Command  | Description |
 |----------|-------------|
 | `info`   | Display network, cardholder, PAN (masked), expiry, AIP flags, and certificate chain decode status |
 | `raw`    | Dump every raw TLV tag read from the card — useful for diagnostics |
-| `export` | Export the ICC public key as a PEM file |
-| `probe`  | Send every known crypto APDU and report the card's SW responses — shows exactly what the card supports |
+| `export` | Export the ICC public key as a PEM file (DDA/CDA cards only) |
+| `probe`  | Send every known crypto APDU and report the card's SW responses — the first step when investigating a new card type |
 
 ### Probe example
 

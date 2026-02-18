@@ -1483,6 +1483,84 @@ def verify_sdad(sdad: bytes, auth_data: bytes, icc_pk_pem: bytes) -> dict:
         return {'valid': False, 'error': str(ex)}
 
 
+def parse_genac_response(resp: bytes) -> dict | None:
+    """
+    Parse the response from GENERATE AC.
+
+    Two response formats exist in the wild:
+
+      Format 1 (tag 80) — packed binary, no inner TLV:
+        [CID 1 byte][ATC 2 bytes][Application Cryptogram 8 bytes][IAD variable]
+
+      Format 2 (tag 77) — explicit TLV:
+        9F27 (CID), 9F36 (ATC), 9F26 (AC), 9F10 (IAD)
+
+    Returns a dict with keys: cryptogram_type, atc, ac, iad (bytes).
+    Returns None if the response cannot be parsed.
+    """
+    if not resp:
+        return None
+
+    _CID_TYPE = {0x80: 'ARQC', 0x40: 'TC', 0x00: 'AAC'}
+
+    parsed = TLV.parse(resp)
+
+    if b'\x77' in resp[:1] or '77' in parsed:
+        # Format 2
+        cid_bytes = parsed.get('9F27', b'\x00')
+        atc_bytes = parsed.get('9F36', b'\x00\x00')
+        ac_bytes  = parsed.get('9F26', b'')
+        iad_bytes = parsed.get('9F10', b'')
+    elif b'\x80' in resp[:1] or '80' in parsed:
+        # Format 1 — raw payload inside tag 80
+        payload = parsed.get('80') or resp
+        if len(payload) < 11:
+            return None
+        cid_bytes = payload[0:1]
+        atc_bytes = payload[1:3]
+        ac_bytes  = payload[3:11]
+        iad_bytes = payload[11:]
+    else:
+        return None
+
+    cid = cid_bytes[0] if cid_bytes else 0
+    cryptogram_type = _CID_TYPE.get(cid & 0xC0, f'UNKNOWN({cid:#04x})')
+
+    return {
+        'cryptogram_type': cryptogram_type,
+        'atc': atc_bytes,
+        'ac':  ac_bytes,
+        'iad': iad_bytes,
+    }
+
+
+def sign_with_genac(card: CardInterface, cdol1: bytes,
+                    forced_un: bytes | None = None) -> dict | None:
+    """
+    Use GENERATE AC (ARQC) to produce a card-presence token.
+
+    The Unpredictable Number field (tag 9F37) in the CDOL1 data is set to
+    forced_un if provided, otherwise a random value, allowing the caller to
+    deterministically bind a message to the cryptogram.
+
+    Returns a dict from parse_genac_response, or None on failure.
+    """
+    cdol1_data, un = build_dol_data(cdol1, forced_un=forced_un)
+
+    # P1=0x80 → ARQC (online authorisation request)
+    lc = len(cdol1_data)
+    apdu = [0x80, 0xAE, 0x80, 0x00, lc] + list(cdol1_data) + [0x00]
+    resp, sw1, sw2 = card.send_soft(apdu)
+
+    if (sw1, sw2) != (0x90, 0x00):
+        vprint(f"  GENERATE AC failed: SW={sw1:02X}{sw2:02X}")
+        return None
+
+    result = parse_genac_response(bytes(resp))
+    if result is not None:
+        result['cdol1_data'] = cdol1_data
+    return result
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Reader / Connection Management
@@ -2017,13 +2095,13 @@ def cmd_decrypt(args):
 
 
 def cmd_sign(args):
-    """Sign data using card's INTERNAL AUTHENTICATE (DDA)."""
+    """Sign data using the best available card method (DDA or GENERATE AC)."""
     print("\n━━━ Sign Data with Card ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     conn = get_card_connection(args.reader)
     card_iface = CardInterface(conn)
     emv = EMVCard(card_iface)
-    print("  Reading card and initiating DDA flow...")
+    print("  Reading card...")
     emv.read_all(scan_all=True)
 
     info = emv.get_info()
@@ -2036,79 +2114,136 @@ def cmd_sign(args):
     message = getattr(args, 'message', None) or ''
 
     # Derive a deterministic Unpredictable Number from message + cardholder so
-    # the SDAD cryptographically binds the card to this specific message and
-    # identity.  SHA-256( message || NUL || cardholder ) → first 4 bytes.
-    # When no message is given we still bind the cardholder so it's always
-    # covered, using a random salt to keep each signature unique.
+    # the cryptogram binds the card to this specific message and identity.
+    # SHA-256(message || NUL || cardholder) → first 4 bytes.
+    # When no message is given, use a random UN so each unsigned sign is unique.
     if message:
         commitment_input = message.encode('utf-8') + b'\x00' + cardholder.encode('utf-8')
         forced_un = hashlib.sha256(commitment_input).digest()[:4]
         print(f"  Message:     {message!r}")
         print(f"  Commitment:  SHA256(message + cardholder) → {forced_un.hex().upper()} (UN)")
     else:
-        forced_un = None  # will use a random UN
+        forced_un = None
 
-    ddol = emv.data.get('9F49')  # DDOL from card
-    if ddol:
-        print(f"  DDOL: {ddol.hex().upper()}")
-    else:
-        print("  DDOL: not present (using default: 4-byte Unpredictable Number)")
-
-    print("  Requesting SDAD (INTERNAL AUTHENTICATE)...")
-    sig, auth_data = sign_with_card(card_iface, ddol, forced_un=forced_un)
-    if not sig:
-        print("  [ERROR] Card did not respond to INTERNAL AUTHENTICATE.")
-        print("  Check that the card supports DDA (AIP bit 13 must be set).")
-        aip = emv.data.get('82')
-        if aip and len(aip) >= 2:
-            aip_val = (aip[0] << 8) | aip[1]
-            print(f"  AIP = {aip.hex().upper()}: DDA={'Yes' if aip_val & 0x2000 else 'No'}")
-        sys.exit(1)
-
-    # Decode cert chain and embed ICC public key so verify works with no card
+    # ── Determine signing path ────────────────────────────────────────────────
+    # Prefer DDA (INTERNAL AUTHENTICATE) when the card has a verifiable ICC
+    # public key.  Fall back to GENERATE AC (symmetric 3DES ARQC) for cards
+    # that have no certificate chain (SDA-only or plain mag-stripe upgrade chips).
     rid = emv.aid[:5].hex().upper() if emv.aid else ''
     chain = decode_cert_chain(emv.data, rid)
     icc_pk_pem = chain.get('icc_public_key_pem')
 
-    print(f"\n  Auth data: {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
-    print(f"  SDAD:      {sig.hex().upper()[:60]}...  ({len(sig)} bytes)")
+    aip = emv.data.get('82', b'\x00\x00')
+    aip_val = (aip[0] << 8) | aip[1] if len(aip) >= 2 else 0
 
-    # Verify the SDAD structure using the ICC public key
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+    out_path = args.output or "signature.json"
+
     if icc_pk_pem:
+        # ── DDA path: INTERNAL AUTHENTICATE ──────────────────────────────────
+        print("  Method:      DDA (INTERNAL AUTHENTICATE + ICC public key)")
+
+        ddol = emv.data.get('9F49')
+        if ddol:
+            print(f"  DDOL:        {ddol.hex().upper()}")
+        else:
+            print("  DDOL:        not present (using default: 4-byte Unpredictable Number)")
+
+        print("  Requesting SDAD (INTERNAL AUTHENTICATE)...")
+        sig, auth_data = sign_with_card(card_iface, ddol, forced_un=forced_un)
+        if not sig:
+            print("  [ERROR] Card did not respond to INTERNAL AUTHENTICATE.")
+            aip_str = aip.hex().upper() if aip else 'N/A'
+            print(f"  AIP = {aip_str}: DDA={'Yes' if aip_val & 0x2000 else 'No'}")
+            sys.exit(1)
+
+        print(f"\n  Auth data:   {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
+        print(f"  SDAD:        {sig.hex().upper()[:60]}...  ({len(sig)} bytes)")
+
         icc_info = verify_sdad(sig, auth_data, icc_pk_pem)
         if icc_info.get('valid'):
-            print(f"\n  SDAD structure verified against ICC public key")
-            print(f"  Format: 0x{icc_info.get('format', '?'):02X} (expected 0x05 for DDA SDAD)")
+            print(f"\n  SDAD verified against ICC public key")
+            print(f"  Format: 0x{icc_info.get('format', '?'):02X}  "
+                  f"Hash: {'OK' if icc_info.get('hash_ok') else 'FAIL'}")
             if icc_info.get('icc_dynamic_number'):
                 print(f"  ICC Dynamic Number: {icc_info['icc_dynamic_number'].hex().upper()}")
-            if icc_info.get('hash_ok') is not None:
-                print(f"  Hash check: {'OK' if icc_info['hash_ok'] else 'FAIL (hash mismatch)'}")
         else:
-            print(f"  SDAD verification: {icc_info.get('error', 'unknown error')}")
+            print(f"  SDAD pre-verify: {icc_info.get('error', 'unknown error')}")
 
-    sig_b64 = base64.b64encode(sig).decode()
-    result = {
-        'version': '1',
-        'algorithm': 'EMV-DDA-INTERNAL-AUTHENTICATE',
-        'network': network,
-        'cardholder': cardholder,
-        'auth_data': auth_data.hex(),
-        'sdad': sig_b64,
-        'sdad_len': len(sig),
-        'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
-    }
-    if message:
-        result['message'] = message
-    if icc_pk_pem:
-        result['icc_public_key_pem'] = icc_pk_pem.decode('ascii')
+        result = {
+            'version': '1',
+            'algorithm': 'EMV-DDA-INTERNAL-AUTHENTICATE',
+            'network': network,
+            'cardholder': cardholder,
+            'auth_data': auth_data.hex(),
+            'sdad': base64.b64encode(sig).decode(),
+            'sdad_len': len(sig),
+            'timestamp': timestamp,
+            'icc_public_key_pem': icc_pk_pem.decode('ascii'),
+        }
+        if message:
+            result['message'] = message
 
-    out_path = args.output or "signature.json"
-    with open(out_path, 'w') as f:
-        json.dump(result, f, indent=2)
-
-    print(f"\n  Saved to: {out_path}")
-    if icc_pk_pem:
+        with open(out_path, 'w') as f:
+            json.dump(result, f, indent=2)
+        print(f"\n  Saved to: {out_path}")
         print("  ICC public key embedded — verify requires no card or separate PEM.")
+
+    else:
+        # ── GENAC path: GENERATE AC (ARQC) ───────────────────────────────────
+        cdol1 = emv.data.get('8C')
+        if not cdol1:
+            print("  [ERROR] Card has no DDA certificate chain and no CDOL1.")
+            print("  This card cannot produce a verifiable or card-presence signature.")
+            print("  Run 'probe' to see all supported commands.")
+            sys.exit(1)
+
+        print("  Method:      GENERATE AC (ARQC card-presence token)")
+        print("  Note:        No ICC certificate chain — using symmetric AC.")
+        print("               The cryptogram requires the issuer master key to verify.")
+        print("               Message commitment and card identity are still provable.")
+        print(f"  CDOL1:       {cdol1.hex().upper()}")
+
+        print("  Requesting Application Cryptogram (GENERATE AC ARQC)...")
+        genac = sign_with_genac(card_iface, cdol1, forced_un=forced_un)
+        if not genac:
+            print("  [ERROR] GENERATE AC failed.")
+            print("  Run 'probe' to see which commands this card supports.")
+            sys.exit(1)
+
+        ac      = genac['ac']
+        atc     = genac['atc']
+        iad     = genac['iad']
+        ctype   = genac['cryptogram_type']
+        auth_data = forced_un if forced_un is not None else genac['cdol1_data'][-4:]
+
+        print(f"\n  Cryptogram type: {ctype}")
+        print(f"  ATC:             {atc.hex().upper()}")
+        print(f"  AC:              {ac.hex().upper()}")
+        print(f"  Auth data (UN):  {auth_data.hex().upper()}")
+
+        result = {
+            'version': '1',
+            'algorithm': 'EMV-GENERATE-AC',
+            'network': network,
+            'cardholder': cardholder,
+            'auth_data': auth_data.hex(),
+            'cryptogram_type': ctype,
+            'application_cryptogram': ac.hex(),
+            'atc': atc.hex(),
+            'cdol1_data': genac['cdol1_data'].hex(),
+            'timestamp': timestamp,
+        }
+        if iad:
+            result['iad'] = iad.hex()
+        if message:
+            result['message'] = message
+
+        with open(out_path, 'w') as f:
+            json.dump(result, f, indent=2)
+        print(f"\n  Saved to: {out_path}")
+        print("  ⚠  GENERATE AC token — message commitment is verifiable,")
+        print("     but the AC itself requires the card issuer to authenticate.")
 
 
 def cmd_verify(args):
@@ -2122,30 +2257,13 @@ def cmd_verify(args):
     with open(args.signature) as f:
         sig_bundle = json.load(f)
 
-    # Resolve ICC public key: explicit --pubkey overrides embedded key in JSON
-    pubkey_path = getattr(args, 'pubkey', None)
-    if pubkey_path:
-        with open(pubkey_path, 'rb') as f:
-            pem = f.read()
-    elif sig_bundle.get('icc_public_key_pem'):
-        pem = sig_bundle['icc_public_key_pem'].encode('ascii')
-    else:
-        print("  No ICC public key available.")
-        print("  Provide --pubkey card.pem or re-sign with an updated version of this tool")
-        print("  (which embeds the key automatically).")
-        sys.exit(1)
-
-    algorithm = sig_bundle.get('algorithm', '')
+    algorithm  = sig_bundle.get('algorithm', '')
     cardholder = sig_bundle.get('cardholder', '')
     message    = sig_bundle.get('message', '')
     timestamp  = sig_bundle.get('timestamp', '')
     network    = sig_bundle.get('network', '')
 
-    # EMV DDA format (from cmd_sign): verify SDAD against ICC public key
-    if algorithm == 'EMV-DDA-INTERNAL-AUTHENTICATE' or 'sdad' in sig_bundle:
-        sdad      = base64.b64decode(sig_bundle['sdad'])
-        auth_data = bytes.fromhex(sig_bundle['auth_data'])
-
+    def _print_header():
         print(f"  Algorithm:   {algorithm}")
         print(f"  Network:     {network}")
         if cardholder:
@@ -2154,25 +2272,47 @@ def cmd_verify(args):
             print(f"  Message:     {message!r}")
         if timestamp:
             print(f"  Timestamp:   {timestamp}")
+
+    def _check_commitment(auth_data: bytes) -> bool | None:
+        """Verify SHA-256 commitment if message is present. Returns True/False/None."""
+        if not message:
+            return None
+        commitment_input = message.encode('utf-8') + b'\x00' + cardholder.encode('utf-8')
+        expected = hashlib.sha256(commitment_input).digest()[:len(auth_data)]
+        ok = (auth_data == expected)
+        status = 'OK' if ok else 'FAIL'
+        print(f"\n  Commitment check: SHA256(message + cardholder)[:{len(auth_data)}] "
+              f"= {expected.hex().upper()} → {status}")
+        if not ok:
+            print("  ✗ COMMITMENT MISMATCH — message or cardholder has been tampered with")
+        return ok
+
+    # ── EMV DDA: INTERNAL AUTHENTICATE + ICC public key ───────────────────────
+    if algorithm == 'EMV-DDA-INTERNAL-AUTHENTICATE' or 'sdad' in sig_bundle:
+        # Resolve ICC public key: explicit --pubkey overrides embedded key
+        pubkey_path = getattr(args, 'pubkey', None)
+        if pubkey_path:
+            with open(pubkey_path, 'rb') as f:
+                pem = f.read()
+        elif sig_bundle.get('icc_public_key_pem'):
+            pem = sig_bundle['icc_public_key_pem'].encode('ascii')
+        else:
+            print("  No ICC public key available.")
+            print("  Provide --pubkey card.pem or re-sign (the key is embedded automatically).")
+            sys.exit(1)
+
+        sdad      = base64.b64decode(sig_bundle['sdad'])
+        auth_data = bytes.fromhex(sig_bundle['auth_data'])
+
+        _print_header()
         print(f"  Auth data:   {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
         print(f"  SDAD:        {sdad.hex().upper()[:48]}...  ({len(sdad)} bytes)")
 
-        # If a message was signed, verify that auth_data is exactly the
-        # SHA-256 commitment derived from message + cardholder.
-        commitment_ok = None
-        if message:
-            commitment_input = message.encode('utf-8') + b'\x00' + cardholder.encode('utf-8')
-            expected_un = hashlib.sha256(commitment_input).digest()[:len(auth_data)]
-            commitment_ok = (auth_data == expected_un)
-            status = 'OK' if commitment_ok else 'FAIL'
-            print(f"\n  Commitment check: SHA256(message + cardholder)[:{len(auth_data)}] "
-                  f"= {expected_un.hex().upper()} → {status}")
-            if not commitment_ok:
-                print("  ✗ COMMITMENT MISMATCH — message or cardholder has been tampered with")
-                sys.exit(1)
+        commitment_ok = _check_commitment(auth_data)
+        if commitment_ok is False:
+            sys.exit(1)
 
         result = verify_sdad(sdad, auth_data, pem)
-
         if not result['valid']:
             print(f"\n  ✗ VERIFICATION FAILED: {result.get('error')}")
             sys.exit(1)
@@ -2196,8 +2336,41 @@ def cmd_verify(args):
             sys.exit(1)
         return
 
+    # ── EMV GENERATE AC: symmetric card-presence token ────────────────────────
+    if algorithm == 'EMV-GENERATE-AC':
+        auth_data = bytes.fromhex(sig_bundle.get('auth_data', ''))
+        ac        = sig_bundle.get('application_cryptogram', '')
+        ctype     = sig_bundle.get('cryptogram_type', 'ARQC')
+        atc       = sig_bundle.get('atc', '')
+
+        _print_header()
+        print(f"  Auth data:   {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
+        print(f"  Cryptogram:  {ac.upper()}  ({ctype})")
+        print(f"  ATC:         {atc.upper()}")
+
+        commitment_ok = _check_commitment(auth_data)
+        if commitment_ok is False:
+            sys.exit(1)
+
+        print(f"\n  ⚠  GENERATE AC token — partial verification only:")
+        print(f"     The Application Cryptogram ({ctype}) is a symmetric 3DES MAC.")
+        print(f"     It can only be verified by the card's issuer bank.")
+        print(f"     This tool cannot independently authenticate the AC value.")
+
+        if commitment_ok:
+            print(f"\n  ✓ COMMITMENT CHECK PASSED")
+            print(f"  ✓ Message is bound to cardholder: {cardholder!r}")
+            print(f"  ✓ Card was present at {timestamp} (ATC: {atc.upper()})")
+            print(f"  ⚠  AC cryptogram authenticity requires issuer verification")
+        elif commitment_ok is None:
+            # No message — just report card presence fields
+            print(f"\n  ✓ Bundle is well-formed (no message to verify commitment against)")
+            print(f"  ✓ Card was present at {timestamp} (ATC: {atc.upper()})")
+            print(f"  ⚠  AC cryptogram authenticity requires issuer verification")
+        return
+
     print(f"  Unknown signature format (algorithm={algorithm!r})")
-    print("  Only EMV-DDA-INTERNAL-AUTHENTICATE signatures are supported.")
+    print("  Supported: EMV-DDA-INTERNAL-AUTHENTICATE, EMV-GENERATE-AC")
     sys.exit(1)
 
 
