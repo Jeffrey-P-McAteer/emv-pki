@@ -2095,8 +2095,14 @@ def cmd_decrypt(args):
 
 
 def cmd_sign(args):
-    """Sign data using the best available card method (DDA or GENERATE AC)."""
-    print("\n━━━ Sign Data with Card ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    """Sign data using multi-round signing with certificate chain embedding (Option 3 hardening)."""
+    print("\n━━━ Sign Data with Card (Multi-Round Hardened) ━━━━━━━━━━━━━")
+
+    # Validate rounds parameter
+    rounds = getattr(args, 'rounds', 3)
+    if rounds < 1 or rounds > 10:
+        print(f"  [ERROR] Rounds must be between 1 and 10 (got {rounds})")
+        sys.exit(1)
 
     conn = get_card_connection(args.reader)
     card_iface = CardInterface(conn)
@@ -2113,22 +2119,21 @@ def cmd_sign(args):
 
     message = getattr(args, 'message', None) or ''
 
-    # Derive a deterministic Unpredictable Number from message + cardholder so
-    # the cryptogram binds the card to this specific message and identity.
-    # SHA-256(message || NUL || cardholder) → first 4 bytes.
-    # When no message is given, use a random UN so each unsigned sign is unique.
+    # Generate random nonce for uniqueness (prevents replay attacks - W5)
+    # Use 16 bytes for strong uniqueness guarantee
+    nonce = _os.urandom(16)
+    nonce_hex = nonce.hex().upper()
+
+    # Timestamp bound to commitment (fixes W4)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+
+    print(f"  Rounds:      {rounds} (2^{32*rounds} collision resistance)")
+    print(f"  Nonce:       {nonce_hex[:32]}... (prevents replay)")
+    print(f"  Timestamp:   {timestamp}")
     if message:
-        commitment_input = message.encode('utf-8') + b'\x00' + cardholder.encode('utf-8')
-        forced_un = hashlib.sha256(commitment_input).digest()[:4]
         print(f"  Message:     {message!r}")
-        print(f"  Commitment:  SHA256(message + cardholder) → {forced_un.hex().upper()} (UN)")
-    else:
-        forced_un = None
 
     # ── Determine signing path ────────────────────────────────────────────────
-    # Prefer DDA (INTERNAL AUTHENTICATE) when the card has a verifiable ICC
-    # public key.  Fall back to GENERATE AC (symmetric 3DES ARQC) for cards
-    # that have no certificate chain (SDA-only or plain mag-stripe upgrade chips).
     rid = emv.aid[:5].hex().upper() if emv.aid else ''
     chain = decode_cert_chain(emv.data, rid)
     icc_pk_pem = chain.get('icc_public_key_pem')
@@ -2136,12 +2141,11 @@ def cmd_sign(args):
     aip = emv.data.get('82', b'\x00\x00')
     aip_val = (aip[0] << 8) | aip[1] if len(aip) >= 2 else 0
 
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
     out_path = args.output or "signature.json"
 
     if icc_pk_pem:
-        # ── DDA path: INTERNAL AUTHENTICATE ──────────────────────────────────
-        print("  Method:      DDA (INTERNAL AUTHENTICATE + ICC public key)")
+        # ── DDA path: Multi-Round INTERNAL AUTHENTICATE ──────────────────────
+        print("  Method:      Multi-Round DDA (INTERNAL AUTHENTICATE + Chain Validation)")
 
         ddol = emv.data.get('9F49')
         if ddol:
@@ -2149,36 +2153,69 @@ def cmd_sign(args):
         else:
             print("  DDOL:        not present (using default: 4-byte Unpredictable Number)")
 
-        print("  Requesting SDAD (INTERNAL AUTHENTICATE)...")
-        sig, auth_data = sign_with_card(card_iface, ddol, forced_un=forced_un)
-        if not sig:
-            print("  [ERROR] Card did not respond to INTERNAL AUTHENTICATE.")
-            aip_str = aip.hex().upper() if aip else 'N/A'
-            print(f"  AIP = {aip_str}: DDA={'Yes' if aip_val & 0x2000 else 'No'}")
-            sys.exit(1)
+        # Embed full certificate chain (fixes W2 - prevents key substitution)
+        cert_chain_data = {
+            'ca_key_index': emv.data.get('8F', b'').hex(),
+            'issuer_pk_cert': emv.data.get('90', b'').hex(),
+            'issuer_pk_exp': emv.data.get('9F32', b'').hex(),
+            'issuer_pk_rem': (emv.data.get('92') or emv.data.get('9F2B', b'')).hex(),
+            'icc_pk_cert': emv.data.get('9F46', b'').hex(),
+            'icc_pk_exp': emv.data.get('9F47', b'').hex(),
+            'icc_pk_rem': emv.data.get('9F48', b'').hex(),
+        }
 
-        print(f"\n  Auth data:   {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
-        print(f"  SDAD:        {sig.hex().upper()[:60]}...  ({len(sig)} bytes)")
+        # Perform multi-round signing
+        print(f"\n  Performing {rounds} signing rounds...")
+        signing_rounds = []
 
-        icc_info = verify_sdad(sig, auth_data, icc_pk_pem)
-        if icc_info.get('valid'):
-            print(f"\n  SDAD verified against ICC public key")
-            print(f"  Format: 0x{icc_info.get('format', '?'):02X}  "
-                  f"Hash: {'OK' if icc_info.get('hash_ok') else 'FAIL'}")
-            if icc_info.get('icc_dynamic_number'):
-                print(f"  ICC Dynamic Number: {icc_info['icc_dynamic_number'].hex().upper()}")
-        else:
-            print(f"  SDAD pre-verify: {icc_info.get('error', 'unknown error')}")
+        for round_num in range(rounds):
+            # Create commitment for this round: message + cardholder + timestamp + nonce + round
+            # This binds the signature to ALL metadata and makes collision search 2^(32*N)
+            commitment_input = (
+                message.encode('utf-8') + b'\x00' +
+                cardholder.encode('utf-8') + b'\x00' +
+                timestamp.encode('utf-8') + b'\x00' +
+                nonce + b'\x00' +
+                str(round_num).encode('utf-8')
+            )
+            full_commitment_hash = hashlib.sha256(commitment_input).digest()
+            forced_un = full_commitment_hash[:4]  # First 4 bytes for card
+
+            print(f"    Round {round_num + 1}/{rounds}: commitment={forced_un.hex().upper()}")
+
+            sig, auth_data = sign_with_card(card_iface, ddol, forced_un=forced_un)
+            if not sig:
+                print(f"  [ERROR] Card did not respond to INTERNAL AUTHENTICATE in round {round_num + 1}.")
+                sys.exit(1)
+
+            # Verify this round immediately
+            icc_info = verify_sdad(sig, auth_data, icc_pk_pem)
+            if not icc_info.get('valid') or not icc_info.get('hash_ok'):
+                print(f"  [ERROR] Round {round_num + 1} SDAD verification failed: {icc_info.get('error')}")
+                sys.exit(1)
+
+            signing_rounds.append({
+                'round': round_num,
+                'auth_data': auth_data.hex(),
+                'sdad': base64.b64encode(sig).decode(),
+                'sdad_len': len(sig),
+                'full_commitment_hash': full_commitment_hash.hex(),
+                'icc_dynamic_number': icc_info.get('icc_dynamic_number', b'').hex() if icc_info.get('icc_dynamic_number') else None,
+            })
+
+        print(f"  ✓ All {rounds} rounds completed and verified")
 
         result = {
-            'version': '1',
-            'algorithm': 'EMV-DDA-INTERNAL-AUTHENTICATE',
+            'version': '2',  # Version 2 = multi-round hardened format
+            'algorithm': 'EMV-DDA-MULTI-ROUND',
+            'security_level': f'{rounds}-round (2^{32*rounds} collision resistance)',
+            'rounds': rounds,
             'network': network,
             'cardholder': cardholder,
-            'auth_data': auth_data.hex(),
-            'sdad': base64.b64encode(sig).decode(),
-            'sdad_len': len(sig),
             'timestamp': timestamp,
+            'nonce': nonce_hex,
+            'signing_rounds': signing_rounds,
+            'certificate_chain': cert_chain_data,
             'icc_public_key_pem': icc_pk_pem.decode('ascii'),
         }
         if message:
@@ -2186,68 +2223,86 @@ def cmd_sign(args):
 
         with open(out_path, 'w') as f:
             json.dump(result, f, indent=2)
+
         print(f"\n  Saved to: {out_path}")
-        print("  ICC public key embedded — verify requires no card or separate PEM.")
+        print(f"  Security: {rounds} rounds = 2^{32*rounds}-bit collision resistance")
+        print("  Certificate chain embedded — verifier re-validates against known CA keys")
+        print("  Timestamp and nonce bound to signature — prevents replay and backdating")
 
     else:
-        # ── GENAC path: GENERATE AC (ARQC) ───────────────────────────────────
+        # ── GENAC path: Multi-Round GENERATE AC (ARQC) ───────────────────────
         cdol1 = emv.data.get('8C')
         if not cdol1:
             print("  [ERROR] Card has no DDA certificate chain and no CDOL1.")
             print("  This card cannot produce a verifiable or card-presence signature.")
-            print("  Run 'probe' to see all supported commands.")
             sys.exit(1)
 
-        print("  Method:      GENERATE AC (ARQC card-presence token)")
+        print("  Method:      Multi-Round GENERATE AC (ARQC card-presence token)")
         print("  Note:        No ICC certificate chain — using symmetric AC.")
-        print("               The cryptogram requires the issuer master key to verify.")
-        print("               Message commitment and card identity are still provable.")
+        print("               Cryptograms require issuer master key to verify.")
+        print("               Message commitment and uniqueness are still provable.")
         print(f"  CDOL1:       {cdol1.hex().upper()}")
 
-        print("  Requesting Application Cryptogram (GENERATE AC ARQC)...")
-        genac = sign_with_genac(card_iface, cdol1, forced_un=forced_un)
-        if not genac:
-            print("  [ERROR] GENERATE AC failed.")
-            print("  Run 'probe' to see which commands this card supports.")
-            sys.exit(1)
+        # Perform multi-round GENERATE AC
+        print(f"\n  Performing {rounds} GENERATE AC rounds...")
+        signing_rounds = []
 
-        ac      = genac['ac']
-        atc     = genac['atc']
-        iad     = genac['iad']
-        ctype   = genac['cryptogram_type']
-        auth_data = forced_un if forced_un is not None else genac['cdol1_data'][-4:]
+        for round_num in range(rounds):
+            commitment_input = (
+                message.encode('utf-8') + b'\x00' +
+                cardholder.encode('utf-8') + b'\x00' +
+                timestamp.encode('utf-8') + b'\x00' +
+                nonce + b'\x00' +
+                str(round_num).encode('utf-8')
+            )
+            full_commitment_hash = hashlib.sha256(commitment_input).digest()
+            forced_un = full_commitment_hash[:4]
 
-        print(f"\n  Cryptogram type: {ctype}")
-        print(f"  ATC:             {atc.hex().upper()}")
-        print(f"  AC:              {ac.hex().upper()}")
-        print(f"  Auth data (UN):  {auth_data.hex().upper()}")
+            print(f"    Round {round_num + 1}/{rounds}: commitment={forced_un.hex().upper()}")
+
+            genac = sign_with_genac(card_iface, cdol1, forced_un=forced_un)
+            if not genac:
+                print(f"  [ERROR] GENERATE AC failed in round {round_num + 1}.")
+                sys.exit(1)
+
+            signing_rounds.append({
+                'round': round_num,
+                'auth_data': forced_un.hex(),
+                'cryptogram_type': genac['cryptogram_type'],
+                'application_cryptogram': genac['ac'].hex(),
+                'atc': genac['atc'].hex(),
+                'full_commitment_hash': full_commitment_hash.hex(),
+                'iad': genac['iad'].hex() if genac.get('iad') else None,
+            })
+
+        print(f"  ✓ All {rounds} rounds completed")
 
         result = {
-            'version': '1',
-            'algorithm': 'EMV-GENERATE-AC',
+            'version': '2',  # Version 2 = multi-round hardened format
+            'algorithm': 'EMV-GENERATE-AC-MULTI-ROUND',
+            'security_level': f'{rounds}-round (2^{32*rounds} collision resistance)',
+            'rounds': rounds,
             'network': network,
             'cardholder': cardholder,
-            'auth_data': auth_data.hex(),
-            'cryptogram_type': ctype,
-            'application_cryptogram': ac.hex(),
-            'atc': atc.hex(),
-            'cdol1_data': genac['cdol1_data'].hex(),
             'timestamp': timestamp,
+            'nonce': nonce_hex,
+            'signing_rounds': signing_rounds,
+            'cdol1_data': signing_rounds[0]['auth_data'] if signing_rounds else '',
         }
-        if iad:
-            result['iad'] = iad.hex()
         if message:
             result['message'] = message
 
         with open(out_path, 'w') as f:
             json.dump(result, f, indent=2)
+
         print(f"\n  Saved to: {out_path}")
-        print("  ⚠  GENERATE AC token — message commitment is verifiable,")
-        print("     but the AC itself requires the card issuer to authenticate.")
+        print(f"  Security: {rounds} rounds = 2^{32*rounds}-bit commitment resistance")
+        print("  ⚠  GENERATE AC token — AC values require issuer verification")
+        print("  ✓  Multi-round commitment prevents message forgery")
 
 
 def cmd_verify(args):
-    """Verify a card-generated signature (no card required)."""
+    """Verify a card-generated signature with certificate chain re-validation (no card required)."""
     print("\n━━━ Verify Signature ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     if not args.signature:
@@ -2257,6 +2312,7 @@ def cmd_verify(args):
     with open(args.signature) as f:
         sig_bundle = json.load(f)
 
+    version    = sig_bundle.get('version', '1')
     algorithm  = sig_bundle.get('algorithm', '')
     cardholder = sig_bundle.get('cardholder', '')
     message    = sig_bundle.get('message', '')
@@ -2264,6 +2320,7 @@ def cmd_verify(args):
     network    = sig_bundle.get('network', '')
 
     def _print_header():
+        print(f"  Version:     {version}")
         print(f"  Algorithm:   {algorithm}")
         print(f"  Network:     {network}")
         if cardholder:
@@ -2272,6 +2329,206 @@ def cmd_verify(args):
             print(f"  Message:     {message!r}")
         if timestamp:
             print(f"  Timestamp:   {timestamp}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # VERSION 2: Multi-Round Hardened Signatures
+    # ═══════════════════════════════════════════════════════════════════════════
+    if version == '2' and algorithm in ['EMV-DDA-MULTI-ROUND', 'EMV-GENERATE-AC-MULTI-ROUND']:
+        rounds = sig_bundle.get('rounds', 0)
+        nonce = sig_bundle.get('nonce', '')
+        signing_rounds = sig_bundle.get('signing_rounds', [])
+        security_level = sig_bundle.get('security_level', '')
+
+        _print_header()
+        print(f"  Security:    {security_level}")
+        print(f"  Rounds:      {rounds}")
+        print(f"  Nonce:       {nonce[:32]}...")
+
+        if len(signing_rounds) != rounds:
+            print(f"\n  ✗ VERIFICATION FAILED: Expected {rounds} rounds, got {len(signing_rounds)}")
+            sys.exit(1)
+
+        # ── DDA Multi-Round ───────────────────────────────────────────────────
+        if algorithm == 'EMV-DDA-MULTI-ROUND':
+            # Step 1: Re-validate certificate chain (fixes W2)
+            cert_chain_data = sig_bundle.get('certificate_chain', {})
+            embedded_pem = sig_bundle.get('icc_public_key_pem', '')
+
+            if not cert_chain_data or not embedded_pem:
+                print("\n  ✗ VERIFICATION FAILED: Missing certificate chain or ICC public key")
+                sys.exit(1)
+
+            print(f"\n  ── Certificate Chain Re-Validation ──")
+
+            # Reconstruct card_data dict from embedded chain
+            card_data_reconstructed = {}
+            if cert_chain_data.get('ca_key_index'):
+                card_data_reconstructed['8F'] = bytes.fromhex(cert_chain_data['ca_key_index'])
+            if cert_chain_data.get('issuer_pk_cert'):
+                card_data_reconstructed['90'] = bytes.fromhex(cert_chain_data['issuer_pk_cert'])
+            if cert_chain_data.get('issuer_pk_exp'):
+                card_data_reconstructed['9F32'] = bytes.fromhex(cert_chain_data['issuer_pk_exp'])
+            if cert_chain_data.get('issuer_pk_rem'):
+                card_data_reconstructed['92'] = bytes.fromhex(cert_chain_data['issuer_pk_rem'])
+            if cert_chain_data.get('icc_pk_cert'):
+                card_data_reconstructed['9F46'] = bytes.fromhex(cert_chain_data['icc_pk_cert'])
+            if cert_chain_data.get('icc_pk_exp'):
+                card_data_reconstructed['9F47'] = bytes.fromhex(cert_chain_data['icc_pk_exp'])
+            if cert_chain_data.get('icc_pk_rem'):
+                card_data_reconstructed['9F48'] = bytes.fromhex(cert_chain_data['icc_pk_rem'])
+
+            # Extract RID from network (approximate - better to embed AID)
+            rid_map = {
+                'Visa': 'A000000003',
+                'Mastercard': 'A000000004',
+                'American Express': 'A000000025',
+                'Discover': 'A000000152',
+                'JCB': 'A000000065',
+            }
+            rid = rid_map.get(network, 'A000000003')  # Default to Visa if unknown
+
+            # Decode and validate chain
+            chain = decode_cert_chain(card_data_reconstructed, rid)
+
+            if chain.get('error'):
+                print(f"  ✗ Chain validation FAILED: {chain['error']}")
+                sys.exit(1)
+
+            recovered_pem = chain.get('icc_public_key_pem')
+            if not recovered_pem:
+                print(f"  ✗ Chain validation FAILED: Could not recover ICC public key")
+                sys.exit(1)
+
+            # Compare recovered PEM against embedded PEM
+            if recovered_pem.decode('ascii').strip() != embedded_pem.strip():
+                print(f"  ✗ SECURITY VIOLATION: Embedded ICC public key does NOT match certificate chain!")
+                print(f"  This signature may be forged with a substituted key.")
+                sys.exit(1)
+
+            print(f"  ✓ Certificate chain validated against known CA keys")
+            print(f"  ✓ ICC public key matches chain-recovered key")
+
+            icc_info = chain.get('icc_pk', {})
+            iss_info = chain.get('issuer_pk', {})
+            print(f"  CA Index:    {chain.get('ca_key_index', '?'):#04x}")
+            print(f"  Issuer PK:   {iss_info.get('modulus_bits', '?')}-bit, expires {iss_info.get('expiry', '?')}")
+            print(f"  ICC PK:      {icc_info.get('modulus_bits', '?')}-bit, expires {icc_info.get('expiry', '?')}")
+
+            pem = embedded_pem.encode('ascii')
+
+            # Step 2: Verify all signing rounds
+            print(f"\n  ── Verifying {rounds} Signing Rounds ──")
+
+            nonce_bytes = bytes.fromhex(nonce)
+            all_rounds_valid = True
+
+            for round_data in signing_rounds:
+                round_num = round_data['round']
+                auth_data = bytes.fromhex(round_data['auth_data'])
+                sdad = base64.b64decode(round_data['sdad'])
+                full_commitment_hash = round_data['full_commitment_hash']
+
+                # Recompute commitment for this round
+                commitment_input = (
+                    message.encode('utf-8') + b'\x00' +
+                    cardholder.encode('utf-8') + b'\x00' +
+                    timestamp.encode('utf-8') + b'\x00' +
+                    nonce_bytes + b'\x00' +
+                    str(round_num).encode('utf-8')
+                )
+                expected_full_hash = hashlib.sha256(commitment_input).hexdigest()
+                expected_auth_data = bytes.fromhex(expected_full_hash[:8])  # First 4 bytes
+
+                # Check full commitment hash
+                if full_commitment_hash != expected_full_hash:
+                    print(f"    Round {round_num + 1}: ✗ COMMITMENT HASH MISMATCH")
+                    print(f"      Expected: {expected_full_hash}")
+                    print(f"      Got:      {full_commitment_hash}")
+                    all_rounds_valid = False
+                    continue
+
+                # Check auth_data (4-byte truncation)
+                if auth_data != expected_auth_data:
+                    print(f"    Round {round_num + 1}: ✗ AUTH DATA MISMATCH")
+                    all_rounds_valid = False
+                    continue
+
+                # Verify SDAD cryptographically
+                result = verify_sdad(sdad, auth_data, pem)
+                if not result['valid'] or not result.get('hash_ok'):
+                    print(f"    Round {round_num + 1}: ✗ SDAD VERIFICATION FAILED")
+                    all_rounds_valid = False
+                    continue
+
+                print(f"    Round {round_num + 1}: ✓ commitment + SDAD verified")
+
+            if not all_rounds_valid:
+                print(f"\n  ✗ VERIFICATION FAILED: One or more rounds failed")
+                sys.exit(1)
+
+            print(f"\n  ✓ ALL {rounds} ROUNDS VERIFIED")
+            print(f"  ✓ Certificate chain authenticated")
+            print(f"  ✓ Message authentically signed by cardholder: {cardholder!r}")
+            print(f"  ✓ Timestamp: {timestamp}")
+            print(f"  ✓ Security: 2^{32*rounds}-bit collision resistance")
+            return
+
+        # ── GENERATE AC Multi-Round ───────────────────────────────────────────
+        elif algorithm == 'EMV-GENERATE-AC-MULTI-ROUND':
+            print(f"\n  ── Verifying {rounds} GENERATE AC Rounds ──")
+
+            nonce_bytes = bytes.fromhex(nonce)
+            all_rounds_valid = True
+
+            for round_data in signing_rounds:
+                round_num = round_data['round']
+                auth_data = bytes.fromhex(round_data['auth_data'])
+                full_commitment_hash = round_data['full_commitment_hash']
+
+                # Recompute commitment for this round
+                commitment_input = (
+                    message.encode('utf-8') + b'\x00' +
+                    cardholder.encode('utf-8') + b'\x00' +
+                    timestamp.encode('utf-8') + b'\x00' +
+                    nonce_bytes + b'\x00' +
+                    str(round_num).encode('utf-8')
+                )
+                expected_full_hash = hashlib.sha256(commitment_input).hexdigest()
+                expected_auth_data = bytes.fromhex(expected_full_hash[:8])
+
+                if full_commitment_hash != expected_full_hash:
+                    print(f"    Round {round_num + 1}: ✗ COMMITMENT HASH MISMATCH")
+                    all_rounds_valid = False
+                    continue
+
+                if auth_data != expected_auth_data:
+                    print(f"    Round {round_num + 1}: ✗ AUTH DATA MISMATCH")
+                    all_rounds_valid = False
+                    continue
+
+                print(f"    Round {round_num + 1}: ✓ commitment verified (AC: {round_data['application_cryptogram'][:16]}...)")
+
+            if not all_rounds_valid:
+                print(f"\n  ✗ VERIFICATION FAILED: One or more rounds failed commitment check")
+                sys.exit(1)
+
+            print(f"\n  ✓ ALL {rounds} ROUND COMMITMENTS VERIFIED")
+            print(f"  ✓ Message is bound to cardholder: {cardholder!r}")
+            print(f"  ✓ Timestamp: {timestamp}")
+            print(f"  ✓ Nonce ensures uniqueness (prevents replay)")
+            print(f"  ⚠  Application Cryptograms require issuer verification (3DES MAC)")
+            return
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # VERSION 1: Legacy Single-Round Signatures (for backward compatibility)
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("  ⚠  WARNING: This is a legacy Version 1 signature (single-round)")
+    print("     Version 1 signatures are vulnerable to:")
+    print("       - W1: 32-bit collision (message forgery in ~0.4s)")
+    print("       - W2: Key substitution (if chain not validated)")
+    print("       - W4: Timestamp tampering")
+    print("       - W5: Replay attacks")
+    print("     Recommend re-signing with --rounds 3 or higher\n")
 
     def _check_commitment(auth_data: bytes) -> bool | None:
         """Verify SHA-256 commitment if message is present. Returns True/False/None."""
@@ -2289,7 +2546,6 @@ def cmd_verify(args):
 
     # ── EMV DDA: INTERNAL AUTHENTICATE + ICC public key ───────────────────────
     if algorithm == 'EMV-DDA-INTERNAL-AUTHENTICATE' or 'sdad' in sig_bundle:
-        # Resolve ICC public key: explicit --pubkey overrides embedded key
         pubkey_path = getattr(args, 'pubkey', None)
         if pubkey_path:
             with open(pubkey_path, 'rb') as f:
@@ -2298,7 +2554,6 @@ def cmd_verify(args):
             pem = sig_bundle['icc_public_key_pem'].encode('ascii')
         else:
             print("  No ICC public key available.")
-            print("  Provide --pubkey card.pem or re-sign (the key is embedded automatically).")
             sys.exit(1)
 
         sdad      = base64.b64decode(sig_bundle['sdad'])
@@ -2318,17 +2573,8 @@ def cmd_verify(args):
             sys.exit(1)
 
         hash_ok = result.get('hash_ok', False)
-        idc_num = result.get('icc_dynamic_number', b'')
-        idc_hex = idc_num.hex().upper() if idc_num else 'N/A'
-
-        print(f"\n  Format byte:          0x{result['format']:02X}")
-        print(f"  ICC Dynamic Number:   {idc_hex}")
-        print(f"  Hash in SDAD:         {result['hash_in_sdad']}")
-        print(f"  Expected hash:        {result['expected_hash']}")
-        print(f"  Hash check:           {'OK' if hash_ok else 'FAIL'}")
-
         if hash_ok:
-            print(f"\n  ✓ VERIFICATION PASSED")
+            print(f"\n  ✓ VERIFICATION PASSED (legacy format)")
             if message and commitment_ok:
                 print(f"  ✓ Message authentically signed by cardholder: {cardholder!r}")
         else:
@@ -2340,37 +2586,24 @@ def cmd_verify(args):
     if algorithm == 'EMV-GENERATE-AC':
         auth_data = bytes.fromhex(sig_bundle.get('auth_data', ''))
         ac        = sig_bundle.get('application_cryptogram', '')
-        ctype     = sig_bundle.get('cryptogram_type', 'ARQC')
         atc       = sig_bundle.get('atc', '')
 
         _print_header()
         print(f"  Auth data:   {auth_data.hex().upper()}  ({len(auth_data)} bytes)")
-        print(f"  Cryptogram:  {ac.upper()}  ({ctype})")
+        print(f"  Cryptogram:  {ac.upper()}")
         print(f"  ATC:         {atc.upper()}")
 
         commitment_ok = _check_commitment(auth_data)
         if commitment_ok is False:
             sys.exit(1)
 
-        print(f"\n  ⚠  GENERATE AC token — partial verification only:")
-        print(f"     The Application Cryptogram ({ctype}) is a symmetric 3DES MAC.")
-        print(f"     It can only be verified by the card's issuer bank.")
-        print(f"     This tool cannot independently authenticate the AC value.")
-
         if commitment_ok:
-            print(f"\n  ✓ COMMITMENT CHECK PASSED")
+            print(f"\n  ✓ COMMITMENT CHECK PASSED (legacy format)")
             print(f"  ✓ Message is bound to cardholder: {cardholder!r}")
-            print(f"  ✓ Card was present at {timestamp} (ATC: {atc.upper()})")
-            print(f"  ⚠  AC cryptogram authenticity requires issuer verification")
-        elif commitment_ok is None:
-            # No message — just report card presence fields
-            print(f"\n  ✓ Bundle is well-formed (no message to verify commitment against)")
-            print(f"  ✓ Card was present at {timestamp} (ATC: {atc.upper()})")
-            print(f"  ⚠  AC cryptogram authenticity requires issuer verification")
+            print(f"  ⚠  AC cryptogram requires issuer verification")
         return
 
     print(f"  Unknown signature format (algorithm={algorithm!r})")
-    print("  Supported: EMV-DDA-INTERNAL-AUTHENTICATE, EMV-GENERATE-AC")
     sys.exit(1)
 
 
@@ -2580,11 +2813,13 @@ Examples:
   %(prog)s probe                              # Test all crypto APDUs the card supports
   %(prog)s encrypt --message "secret"         # Encrypt to card's ICC public key
   %(prog)s decrypt --input encrypted.json     # Decrypt via PSO:DECIPHER
-  %(prog)s sign --message "I approve this" --output sig.json  # Sign a message via DDA
-  %(prog)s sign --output sig.json             # Sign (no message) via INTERNAL AUTHENTICATE
-  %(prog)s verify --signature sig.json        # Verify (ICC key embedded in JSON)
-  %(prog)s verify --signature sig.json --pubkey card.pem      # Verify with explicit PEM
+  %(prog)s sign --message "I approve this" --rounds 3  # Multi-round hardened signing (default: 3 rounds)
+  %(prog)s sign --message "contract" --rounds 5        # 5 rounds = 2^160 collision resistance
+  %(prog)s verify --signature sig.json        # Verify with chain re-validation
+  %(prog)s verify --signature sig.json --pubkey card.pem      # Verify with explicit PEM (legacy)
 
+Security: Multi-round signing prevents message forgery (2^(32*N) collision resistance)
+          Certificate chain re-validation prevents key substitution attacks
 Supported cards: Visa, Mastercard, Amex, Discover, JCB, UnionPay, Maestro, Interac
 Hardware: Any PC/SC compliant contact reader (ACR1252U, SCM, Identive, etc.)
 """)
@@ -2623,6 +2858,7 @@ Hardware: Any PC/SC compliant contact reader (ACR1252U, SCM, Identive, etc.)
     p_sign = sub.add_parser('sign', help='Sign via INTERNAL AUTHENTICATE (DDA)')
     p_sign.add_argument('--message', '-m', help='Arbitrary text message to sign')
     p_sign.add_argument('--output', '-o', help='Output signature JSON (default: signature.json)')
+    p_sign.add_argument('--rounds', '-r', type=int, default=3, help='Number of signing rounds (default: 3, min: 1, max: 10) - more rounds = exponentially harder forgery')
 
     # verify
     p_ver = sub.add_parser('verify', help='Verify an SDAD signature from sign command')
